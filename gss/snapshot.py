@@ -68,3 +68,55 @@ class TelemetrySnapshot:
     # Horizontal dilution of precision from GPS_RAW_INT (eph / 100). ``None``
     # when the vehicle reports it as unknown (UINT16_MAX).
     gps_hdop: float | None = None
+
+    # --- observed conditions (v0.5) -----------------------------------------
+    # Measured by the aircraft, not forecast. This is the ONLY weather data an
+    # in-flight decision may use (rule R1: no internet while airborne), and it
+    # is better data anyway -- a forecast is a guess about a 10 km square, the
+    # drone is measuring the air it is actually in.
+    wind_speed_ms: float | None = None          # ArduPilot EKF wind estimate
+    wind_direction_deg: float | None = None     # direction the wind blows FROM
+    throttle_pct: float | None = None           # VFR_HUD throttle, 0-100
+    climb_rate_ms: float | None = None          # VFR_HUD climb (+ up)
+    vibration_x: float | None = None
+    vibration_y: float | None = None
+    vibration_z: float | None = None
+    vibration_clip_x: int | None = None
+    vibration_clip_y: int | None = None
+    vibration_clip_z: int | None = None
+    wind_age_s: float | None = None             # since the last WIND / WIND_COV
+    vibration_age_s: float | None = None        # since the last VIBRATION
+
+
+@dataclass(frozen=True)
+class SafeSpot:
+    """A place the drone can put itself down that is NOT its dock (v0.5.1).
+
+    Loaded from the ``safe_spots`` table (or ``config.SAFE_SPOTS_FALLBACK``) by
+    :mod:`gss.safe_spots` and handed to the pure safety core as plain data --
+    :mod:`gss.safety` never reads the database (rule **R1**). ``surface`` is
+    advisory: ``open_ground`` | ``terrace`` | ``field`` | ``rooftop``.
+
+    Two tiers, and the divert selection respects the difference:
+
+      * ``has_marker`` True  -- an ArUco pad the vision pipeline can land on
+        accurately; a small ``radius_m`` is fine.
+      * ``has_marker`` False -- GPS only. Selection ignores a small
+        ``radius_m`` claim (needs ``config.SAFE_SPOT_MIN_GPS_RADIUS_M`` of
+        genuinely clear ground) and refuses a non-zero ``height_above_dock_m``
+        outright (GPS cannot put an aircraft on a raised surface it cannot see).
+
+    ``height_above_dock_m`` is relative to the home point, because that is what
+    the aircraft measures altitude against.
+    """
+
+    name: str
+    lat: float
+    lon: float
+    radius_m: float = 10.0
+    surface: str = "open_ground"
+    has_marker: bool = False
+    height_above_dock_m: float = 0.0
+    marker_id: str | None = None
+    approach_bearing_deg: float | None = None
+    hazards: str | None = None

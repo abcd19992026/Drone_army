@@ -639,6 +639,38 @@ class TelemetryStore:
         )
         return out.ok
 
+    def create_alert(
+        self,
+        *,
+        mission_id: str | None = None,
+        channel: str = "whatsapp",
+        status: str = "queued",
+        template_name: str | None = None,
+        detail: dict | None = None,
+    ) -> str | None:
+        """INSERT an alerts row (v0.5). WhatsApp delivery is a later phase --
+        the row records that someone needs to be told, and why. Retried hard
+        like the other state writes: an unwritten 'no drone is coming' alert is
+        the worst possible silent failure."""
+        body = {
+            "mission_id": mission_id,
+            "channel": channel,
+            "status": status,
+            "template_name": template_name,
+            "detail": detail,
+        }
+        out = self._sync_call(
+            "POST", "/rest/v1/alerts", None, body,
+            prefer="return=representation", what="create_alert",
+        )
+        if not out.ok:
+            log.error("store: alert NOT written (%s): %s", out.status, detail)
+            return None
+        try:
+            return json.loads(out.body)[0]["id"]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError):
+            return None
+
     def list_pending_command_ids(self, drone_id: str) -> list[str]:
         """The poller's query: ids of pending commands for this drone."""
         out = self._sync_call(
@@ -657,6 +689,29 @@ class TelemetryStore:
             return [row["id"] for row in json.loads(out.body)]
         except (json.JSONDecodeError, KeyError, TypeError):
             log.error("store: pending-commands query returned junk: %r", out.body[:200])
+            return []
+
+    def list_safe_spots(self) -> list[dict]:
+        """The active safe spots, highest priority first (v0.5.1). Fed to
+        gss/safe_spots.py, which caches them and hands them to the pure safety
+        core -- safety.py never calls this (R1)."""
+        out = self._sync_call(
+            "GET", "/rest/v1/safe_spots",
+            {
+                "active": "eq.true",
+                "select": "id,name,lat,lon,radius_m,surface,has_marker,"
+                          "height_above_dock_m,marker_id,approach_bearing_deg,"
+                          "hazards,priority,active",
+                "order": "priority.desc",
+            },
+            None, attempts=3, timeout=6.0, what="list safe spots",
+        )
+        if not out.ok:
+            return []
+        try:
+            return list(json.loads(out.body))
+        except (json.JSONDecodeError, TypeError):
+            log.error("store: safe-spots query returned junk: %r", out.body[:200])
             return []
 
     def list_active_missions(self, drone_id: str) -> list[dict]:

@@ -47,14 +47,22 @@ def run() -> int:
     link = MavlinkLink()
     reader = TelemetryReader(link)
     store = _make_store(reader)
+    safe_spots = None
     safety = None
+    weather = None
     intake = None
     shutdown = threading.Event()
 
     try:
+        # The safe-spot book: the list safety.py diverts to when home is not
+        # reachable. Never None -- config.SAFE_SPOTS_FALLBACK guarantees a
+        # non-empty list even with no database and no cache.
+        safe_spots = _make_safe_spots(store)
+        safe_spots.start()
+
         # Safety is a HARD start-up requirement -- see _make_safety. If it
         # cannot be built or started, the GSS does not run.
-        safety = _make_safety(reader, store)
+        safety = _make_safety(reader, store, safe_spots)
         try:
             safety.start()
         except Exception:
@@ -65,7 +73,11 @@ def run() -> int:
             )
             return 3
 
-        intake = _make_intake(store, reader, safety)
+        weather = _make_weather(reader, store)
+        if weather is not None:
+            weather.start()
+
+        intake = _make_intake(store, reader, safety, weather)
         if store is not None:
             store.start()
         if intake is not None:
@@ -88,9 +100,14 @@ def run() -> int:
         if intake is not None:
             log.info("Stopping command intake...")
             intake.close(timeout_s=5.0)
+        if weather is not None:
+            log.info("Stopping weather monitor...")
+            weather.close(timeout_s=3.0)
         if safety is not None:
             log.info("Stopping safety monitor...")
             safety.close(timeout_s=3.0)
+        if safe_spots is not None:
+            safe_spots.close(timeout_s=2.0)
         if store is not None:
             log.info("Flushing Supabase queue...")
             store.close(timeout_s=5.0)
@@ -100,7 +117,20 @@ def run() -> int:
     return 0
 
 
-def _make_safety(reader: TelemetryReader, store):
+def _make_safe_spots(store):
+    """Build the safe-spot book. Never None: ``config.SAFE_SPOTS_FALLBACK``
+    (the dock, at least) makes the list non-empty even with no database and no
+    cache. R1 holds -- safety.py gets this list as plain data via a callable,
+    it never reads the database itself. A ``None`` store just means the book
+    runs on the disk cache + the config fallback.
+    """
+    from gss.safe_spots import SafeSpotBook
+
+    fetch = store.list_safe_spots if store is not None else None
+    return SafeSpotBook(fetch=fetch)
+
+
+def _make_safety(reader: TelemetryReader, store, safe_spots):
     """Build the safety monitor. It runs regardless of Supabase (rule R1): a
     ``None`` store just means no best-effort event mirror, local logs stand.
 
@@ -119,6 +149,7 @@ def _make_safety(reader: TelemetryReader, store):
         return SafetyMonitor(
             reader.get_snapshot,
             event_sink=(store.log_event if store is not None else None),
+            safe_spots_source=(safe_spots.current if safe_spots is not None else None),
         )
     except Exception:
         log.critical(
@@ -127,6 +158,30 @@ def _make_safety(reader: TelemetryReader, store):
             exc_info=True,
         )
         raise SystemExit(3)
+
+
+def _make_weather(reader: TelemetryReader, store):
+    """Build the weather monitor, or None.
+
+    Weather is NOT a hard requirement: with ``WEATHER_ENABLED=false`` (or a
+    construction failure) the GSS runs exactly as v0.4 did. weather.py can only
+    make the system more conservative, never less, and it never overrides
+    safety.py -- so its absence removes a feature, it does not remove a
+    guarantee (rules R1/R10).
+    """
+    if not config.WEATHER_ENABLED:
+        log.info("Weather awareness disabled (WEATHER_ENABLED=false); v0.4 behaviour.")
+        return None
+    try:
+        from gss.weather_feed import WeatherMonitor
+
+        return WeatherMonitor(
+            reader.get_snapshot,
+            event_sink=(store.log_event if store is not None else None),
+        )
+    except Exception:
+        log.exception("Could not initialise weather awareness; continuing without it")
+        return None
 
 
 def _make_store(reader: TelemetryReader):
@@ -147,7 +202,7 @@ def _make_store(reader: TelemetryReader):
         return None
 
 
-def _make_intake(store, reader: TelemetryReader, safety):
+def _make_intake(store, reader: TelemetryReader, safety, weather):
     """Build the command intake, or None. Requires the store (Supabase).
 
     A construction failure is logged and downgraded to None -- the GSS still
@@ -162,7 +217,9 @@ def _make_intake(store, reader: TelemetryReader, safety):
     try:
         from gss.commands import CommandIntake
 
-        return CommandIntake(store, reader.get_snapshot, safety=safety)
+        return CommandIntake(
+            store, reader.get_snapshot, safety=safety, weather=weather
+        )
     except Exception:
         log.exception("Could not initialise command intake; continuing without it")
         return None

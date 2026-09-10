@@ -52,14 +52,54 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 
-from gss import config
-from gss.snapshot import TelemetrySnapshot
+from gss import config, weather
+from gss.snapshot import SafeSpot, TelemetrySnapshot
 
 log = logging.getLogger(__name__)
+
+
+def _observed_wind(
+    snapshot: TelemetrySnapshot,
+) -> tuple[float | None, float | None]:
+    """The aircraft's OWN measured wind as ``(speed_ms, blows_from_deg)``, or
+    ``(None, None)`` when it is missing or stale. Never a forecast (R1)."""
+    if (
+        snapshot.wind_speed_ms is None
+        or snapshot.wind_direction_deg is None
+        or snapshot.wind_age_s is None
+        or snapshot.wind_age_s > config.GPS_MAX_AGE_S
+    ):
+        return None, None
+    return snapshot.wind_speed_ms, snapshot.wind_direction_deg
+
+
+def _observed_headwind_home(
+    snapshot: TelemetrySnapshot, context: SafetyContext
+) -> float:
+    """Headwind component (m/s) the drone would fly into on the way home, from
+    the aircraft's OWN measured wind (never a forecast -- R1). 0.0 when wind
+    data is missing, stale, or home/position is unknown. Fed into the
+    point-of-no-return estimate: a 10 m/s headwind against a 10 m/s cruise
+    means the drone does not get home at all.
+    """
+    speed, from_deg = _observed_wind(snapshot)
+    if (
+        speed is None
+        or from_deg is None
+        or snapshot.lat is None
+        or snapshot.lon is None
+        or context.home_lat is None
+        or context.home_lon is None
+    ):
+        return 0.0
+    course = weather.bearing_deg(
+        snapshot.lat, snapshot.lon, context.home_lat, context.home_lon
+    )
+    return weather.headwind_component_ms(from_deg, speed, course)
 
 
 # ===========================================================================
@@ -79,6 +119,12 @@ class SafetyAction(str, Enum):
     # not by itself mean abandon the mission.
     DESCEND = "DESCEND"
     RTL_NOW = "RTL_NOW"
+    # Home is NOT reachable with the battery available -- fly to the nearest
+    # reachable known safe spot and land there. Between RTL_NOW and LAND_NOW:
+    # starting a return the aircraft cannot finish is worse than landing
+    # somewhere deliberate; landing on whatever is directly beneath it right
+    # now (LAND_NOW) is the last resort when nothing else is reachable.
+    DIVERT = "DIVERT"
     LAND_NOW = "LAND_NOW"
     REJECT = "REJECT"
 
@@ -98,8 +144,9 @@ _ACTION_RANK: dict[SafetyAction, int] = {
     SafetyAction.HOLD: 2,
     SafetyAction.DESCEND: 3,
     SafetyAction.RTL_NOW: 4,
-    SafetyAction.LAND_NOW: 5,
-    SafetyAction.REJECT: 6,
+    SafetyAction.DIVERT: 5,
+    SafetyAction.LAND_NOW: 6,
+    SafetyAction.REJECT: 7,
 }
 _SEVERITY_RANK: dict[SafetySeverity, int] = {
     SafetySeverity.NOMINAL: 0,
@@ -109,7 +156,13 @@ _SEVERITY_RANK: dict[SafetySeverity, int] = {
 }
 
 # Verdicts that latch until the drone is on the ground and disarmed (R13).
-_LATCHABLE: tuple[SafetyAction, ...] = (SafetyAction.RTL_NOW, SafetyAction.LAND_NOW)
+# DIVERT latches too: a momentarily better battery reading does not un-decide
+# "home is not reachable".
+_LATCHABLE: tuple[SafetyAction, ...] = (
+    SafetyAction.RTL_NOW,
+    SafetyAction.DIVERT,
+    SafetyAction.LAND_NOW,
+)
 
 
 @dataclass(frozen=True)
@@ -126,10 +179,15 @@ class SafetyVerdict:
     reasons: tuple[str, ...]
     checked_at: datetime
     latched: bool = False
-    # The action currently latched (RTL_NOW / LAND_NOW), or None. The shell
-    # feeds this back into the next evaluation as ``prior_latch``. It is a
+    # The action currently latched (RTL_NOW / DIVERT / LAND_NOW), or None. The
+    # shell feeds this back into the next evaluation as ``prior_latch``. It is a
     # companion to ``latched`` above, not a separate concept.
     latch_action: SafetyAction | None = None
+    # For DIVERT (and a LAND_NOW where nothing was reachable): the structured
+    # facts the alert / mission_events row needs -- the chosen spot, its
+    # coordinates, and why home was out of reach, with the numbers. ``None``
+    # for every other verdict.
+    divert_target: dict | None = None
 
     def is_veto(self) -> bool:
         """True when this verdict forbids or interrupts flight."""
@@ -155,6 +213,11 @@ class SafetyContext:
     human_lon: float | None = None
     # Pre-flight only: is a mission already running for this drone?
     mission_active: bool = False
+    # The known safe spots to divert to when home is not reachable. Plain data,
+    # passed in by the shell (loaded from Supabase + a disk cache + a hardcoded
+    # config fallback by gss.safe_spots) -- safety.py never reads the database
+    # (R1). Empty is a valid state; the verdict is then LAND_NOW, not DIVERT.
+    safe_spots: tuple[SafeSpot, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,6 +227,9 @@ class _Finding:
     action: SafetyAction
     severity: SafetySeverity
     reason: str
+    # Structured facts for the verdict, when the string reason is not enough
+    # (currently only the point-of-no-return DIVERT / LAND_NOW findings).
+    data: dict | None = None
 
 
 # ===========================================================================
@@ -180,6 +246,15 @@ _VERT_SPEED_MS = 2.0           # assumed climb/descent rate for the altitude sli
 # ~4.8 %/min -- a full pack in ~21 min, deliberately faster (more pessimistic)
 # than the ~40 min hover endurance so an unknown rate errs toward coming home.
 _FALLBACK_DISCHARGE_PCT_PER_S = 0.08
+# A pack cannot physically sustain much more than this. The OBSERVED rate can
+# briefly read far higher just after a coarse (1 %) telemetry step or a current
+# spike; clamp it so one noisy sample cannot turn a routine return into "land
+# in a field". ~0.15 %/s is ~11 min from full to empty -- already aggressive.
+_MAX_DISCHARGE_PCT_PER_S = 0.15
+# At or below this, a spot's height above the dock is "ground level". Above it,
+# a GPS-only spot is refused -- descending onto a raised surface the aircraft
+# cannot see, on GPS alone, means descending into a wall.
+_RAISED_SURFACE_EPS_M = 0.5
 _ENROUTE_PHASES = frozenset({"enroute", "returning"})
 
 
@@ -505,6 +580,28 @@ def check_lateral_offset(
     return []
 
 
+def _return_budget_pct(
+    dist_m: float,
+    alt_m: float,
+    *,
+    discharge_rate_pct_per_s: float | None,
+    wind_ms: float,
+) -> float:
+    """Battery percent to fly ``dist_m`` at altitude ``alt_m`` and land, with
+    RTL_RESERVE_PCT to spare, into a ``wind_ms`` headwind (negative = tailwind,
+    not credited)."""
+    ground_speed = max(_MIN_RETURN_SPEED_MS, config.CRUISE_SPEED_MS - max(0.0, wind_ms))
+    cruise_s = dist_m / ground_speed
+    maneuver_s = _CLIMB_DESCEND_LAND_S + max(0.0, alt_m) / _VERT_SPEED_MS
+    rate = (
+        discharge_rate_pct_per_s
+        if discharge_rate_pct_per_s and discharge_rate_pct_per_s > 0
+        else _FALLBACK_DISCHARGE_PCT_PER_S
+    )
+    rate = min(rate, _MAX_DISCHARGE_PCT_PER_S)
+    return (cruise_s + maneuver_s) * rate + config.RTL_RESERVE_PCT
+
+
 def estimate_return_budget_pct(
     snapshot: TelemetrySnapshot,
     context: SafetyContext,
@@ -516,23 +613,90 @@ def estimate_return_budget_pct(
     with RTL_RESERVE_PCT to spare. ``None`` if it cannot be computed.
 
     ``wind_ms`` is a headwind component in m/s that slows the return ground
-    speed. It defaults to neutral now; v0.5 feeds a real wind estimate in --
-    the parameter exists so that is not a retrofit.
+    speed -- the shell feeds in a real measured-wind estimate (a 10 m/s
+    headwind against a 10 m/s cruise means the drone does not get home at all).
     """
     home = _home(context)
     if home is None or not snapshot.position_valid or snapshot.lat is None or snapshot.lon is None:
         return None
     dist = great_circle_m(home[0], home[1], snapshot.lat, snapshot.lon)
-    ground_speed = max(_MIN_RETURN_SPEED_MS, config.CRUISE_SPEED_MS - max(0.0, wind_ms))
-    cruise_s = dist / ground_speed
     alt = snapshot.alt_m_relative if snapshot.alt_m_relative is not None else config.ON_STATION_ALT
-    maneuver_s = _CLIMB_DESCEND_LAND_S + max(0.0, alt) / _VERT_SPEED_MS
-    rate = (
-        discharge_rate_pct_per_s
-        if discharge_rate_pct_per_s and discharge_rate_pct_per_s > 0
-        else _FALLBACK_DISCHARGE_PCT_PER_S
+    return _return_budget_pct(
+        dist, alt, discharge_rate_pct_per_s=discharge_rate_pct_per_s, wind_ms=wind_ms
     )
-    return (cruise_s + maneuver_s) * rate + config.RTL_RESERVE_PCT
+
+
+def select_divert_spot(
+    snapshot: TelemetrySnapshot,
+    context: SafetyContext,
+    *,
+    discharge_rate_pct_per_s: float | None,
+    wind_speed_ms: float | None = None,
+    wind_from_deg: float | None = None,
+) -> tuple[SafeSpot, float, float] | None:
+    """The safe spot in ``context.safe_spots`` to divert to, as ``(spot,
+    distance_m, needed_pct)``. ``None`` when nothing acceptable is reachable.
+
+    Reachability uses the SAME headwind-aware budget as the point of no return
+    -- the measured wind projected onto the course to each candidate -- not a
+    straight-line guess.
+
+    Two tiers, respected here and not merely stored on the row:
+
+      * a GPS-only spot (``has_marker`` False) whose ``radius_m`` is below
+        ``config.SAFE_SPOT_MIN_GPS_RADIUS_M`` is REJECTED -- the row's number is
+        not trusted against 3-10 m of GPS error;
+      * a GPS-only spot with a non-zero ``height_above_dock_m`` is REJECTED --
+        GPS cannot put an aircraft onto a raised surface it cannot see;
+      * a marker pad is preferred over a GPS-only spot even when it is further,
+        by up to ``config.SAFE_SPOT_MARKER_PREFERENCE_M`` -- an accurate landing
+        on a known pad is worth a kilometre of battery.
+    """
+    if (
+        not context.safe_spots
+        or snapshot.lat is None
+        or snapshot.lon is None
+        or snapshot.battery_pct is None
+    ):
+        return None
+    pct = float(snapshot.battery_pct)
+    alt = snapshot.alt_m_relative if snapshot.alt_m_relative is not None else config.ON_STATION_ALT
+    reachable_marker: list[tuple[float, SafeSpot, float]] = []
+    reachable_gps: list[tuple[float, SafeSpot, float]] = []
+    for spot in context.safe_spots:
+        if not spot.has_marker:
+            if spot.radius_m < config.SAFE_SPOT_MIN_GPS_RADIUS_M:
+                continue
+            if abs(spot.height_above_dock_m) > _RAISED_SURFACE_EPS_M:
+                continue
+        dist = great_circle_m(snapshot.lat, snapshot.lon, spot.lat, spot.lon)
+        if dist > config.SAFE_SPOT_MAX_DISTANCE_M:
+            continue
+        course = weather.bearing_deg(snapshot.lat, snapshot.lon, spot.lat, spot.lon)
+        head = weather.headwind_component_ms(wind_from_deg, wind_speed_ms, course)
+        needed = _return_budget_pct(
+            dist, alt, discharge_rate_pct_per_s=discharge_rate_pct_per_s, wind_ms=head
+        )
+        if needed > pct:
+            continue
+        (reachable_marker if spot.has_marker else reachable_gps).append((dist, spot, needed))
+
+    if not reachable_marker and not reachable_gps:
+        return None
+    reachable_marker.sort(key=lambda r: r[0])
+    reachable_gps.sort(key=lambda r: r[0])
+
+    if reachable_marker:
+        m_dist, m_spot, m_needed = reachable_marker[0]
+        if (
+            not reachable_gps
+            or m_dist <= reachable_gps[0][0] + config.SAFE_SPOT_MARKER_PREFERENCE_M
+        ):
+            return m_spot, m_dist, m_needed
+    # no acceptable marker pad within the preference distance -> the nearest
+    # reachable GPS-only spot.
+    dist, spot, needed = reachable_gps[0]
+    return spot, dist, needed
 
 
 def check_point_of_no_return(
@@ -541,10 +705,19 @@ def check_point_of_no_return(
     *,
     discharge_rate_pct_per_s: float | None,
     wind_ms: float = 0.0,
+    wind_speed_ms: float | None = None,
+    wind_from_deg: float | None = None,
 ) -> list[_Finding]:
-    """Every tick: is there still enough battery to get home? At or below the
-    figure -> RTL_NOW, latched. This outranks any command, including a human
-    telling it to stay."""
+    """Every tick: is there still enough battery to get home?
+
+      * comfortably yes -> nothing;
+      * no, but home is still reachable (eating into the reserve) -> RTL_NOW;
+      * home is NOT reachable (budget over RETURN_BUDGET_IMPOSSIBLE_PCT, or over
+        the battery left plus the reserve) -> DIVERT to the nearest reachable
+        safe spot, or LAND_NOW if nothing is reachable.
+
+    All of these latch and outrank any command, a human saying "stay" included.
+    """
     if not _airborne(snapshot):
         return []
     needed = estimate_return_budget_pct(
@@ -564,22 +737,102 @@ def check_point_of_no_return(
     pct = snapshot.battery_pct
     if pct is None:
         return []  # check_battery already ordered LAND_NOW
-    if pct <= needed:
-        home = _home(context)
-        dist = (
-            great_circle_m(home[0], home[1], snapshot.lat, snapshot.lon)
-            if home and snapshot.lat is not None and snapshot.lon is not None
-            else float("nan")
-        )
+    if pct > needed:
+        return []
+
+    home = _home(context)
+    dist_home = (
+        great_circle_m(home[0], home[1], snapshot.lat, snapshot.lon)
+        if home and snapshot.lat is not None and snapshot.lon is not None
+        else float("nan")
+    )
+    headwind = max(0.0, wind_ms)
+    home_unreachable = (
+        needed > config.RETURN_BUDGET_IMPOSSIBLE_PCT
+        or needed > pct + config.RTL_RESERVE_PCT
+    )
+
+    if not home_unreachable:
         return [
             _Finding(
                 SafetyAction.RTL_NOW,
                 SafetySeverity.CRITICAL,
                 f"point of no return: {pct:.0f}% left, need ~{needed:.0f}% to reach "
-                f"home ({dist:.0f} m, +{config.RTL_RESERVE_PCT:.0f}% reserve)",
+                f"home ({dist_home:.0f} m"
+                + (f" into a {headwind:.0f} m/s headwind" if headwind > 0.5 else "")
+                + f", +{config.RTL_RESERVE_PCT:.0f}% reserve)",
             )
         ]
-    return []
+
+    pick = select_divert_spot(
+        snapshot,
+        context,
+        discharge_rate_pct_per_s=discharge_rate_pct_per_s,
+        wind_speed_ms=wind_speed_ms,
+        wind_from_deg=wind_from_deg,
+    )
+    _dist_home = None if dist_home != dist_home else round(dist_home, 1)  # NaN check
+    if pick is not None:
+        spot, spot_dist, spot_needed = pick
+        landing = (
+            f"ArUco pad{f' {spot.marker_id}' if spot.marker_id else ''}"
+            if spot.has_marker
+            else f"GPS-only, {spot.radius_m:.0f} m clear ground"
+        )
+        data = {
+            "spot_name": spot.name,
+            "spot_lat": spot.lat,
+            "spot_lon": spot.lon,
+            "spot_surface": spot.surface,
+            "spot_has_marker": spot.has_marker,
+            "spot_marker_id": spot.marker_id,
+            "spot_height_above_dock_m": spot.height_above_dock_m,
+            "spot_radius_m": spot.radius_m,
+            "spot_distance_m": round(spot_dist, 1),
+            "spot_needed_pct": round(spot_needed, 1),
+            "battery_pct": round(float(pct), 1),
+            "home_distance_m": _dist_home,
+            "home_needed_pct": round(needed, 1),
+            "headwind_ms": round(headwind, 1),
+        }
+        return [
+            _Finding(
+                SafetyAction.DIVERT,
+                SafetySeverity.CRITICAL,
+                f"home not reachable: {pct:.0f}% left, need ~{needed:.0f}% to fly the "
+                f"{dist_home:.0f} m home"
+                + (f" into a {headwind:.0f} m/s headwind" if headwind > 0.5 else "")
+                + f". Diverting to safe spot '{spot.name}' [{landing}] "
+                f"({spot.lat:.5f}, {spot.lon:.5f}), {spot_dist:.0f} m, "
+                f"need ~{spot_needed:.0f}%",
+                data,
+            )
+        ]
+
+    data = {
+        "nowhere_reachable": True,
+        "last_lat": snapshot.lat,
+        "last_lon": snapshot.lon,
+        "battery_pct": round(float(pct), 1),
+        "home_distance_m": _dist_home,
+        "home_needed_pct": round(needed, 1),
+        "headwind_ms": round(headwind, 1),
+        # BEACON HOOK (Phase 14 payload plan): the aircraft is putting itself
+        # down away from the dock with nothing reachable -- the spotlight +
+        # siren are how a person finds it. That payload does not exist yet;
+        # this is where its activation attaches.
+        "beacon": "attach spotlight+siren activation here (Phase 14)",
+    }
+    return [
+        _Finding(
+            SafetyAction.LAND_NOW,
+            SafetySeverity.EMERGENCY,
+            f"home not reachable ({pct:.0f}% left, need ~{needed:.0f}% for the "
+            f"{dist_home:.0f} m) and no safe spot in range is reachable either -- "
+            f"landing here at {snapshot.lat:.5f}, {snapshot.lon:.5f}",
+            data,
+        )
+    ]
 
 
 def check_preflight_readiness(
@@ -634,6 +887,8 @@ def _inflight_findings(
     gps_bad_s: float,
     discharge_rate_pct_per_s: float | None,
     wind_ms: float,
+    wind_speed_ms: float | None = None,
+    wind_from_deg: float | None = None,
 ) -> tuple[list[_Finding], list[str]]:
     """Run every in-flight check. A check that raises does NOT abort the
     evaluation and does NOT count as passing: it contributes a DENY finding
@@ -651,6 +906,8 @@ def _inflight_findings(
                 context,
                 discharge_rate_pct_per_s=discharge_rate_pct_per_s,
                 wind_ms=wind_ms,
+                wind_speed_ms=wind_speed_ms,
+                wind_from_deg=wind_from_deg,
             ),
         ),
     ]
@@ -761,6 +1018,8 @@ def evaluate(
     gps_bad_s: float = 0.0,
     discharge_rate_pct_per_s: float | None = None,
     wind_ms: float = 0.0,
+    wind_speed_ms: float | None = None,
+    wind_from_deg: float | None = None,
     prior_latch: SafetyAction | None = None,
 ) -> SafetyVerdict:
     """The one decision function. Pure: state in, verdict out.
@@ -795,9 +1054,19 @@ def evaluate(
         gps_bad_s=gps_bad_s,
         discharge_rate_pct_per_s=discharge_rate_pct_per_s,
         wind_ms=wind_ms,
+        wind_speed_ms=wind_speed_ms,
+        wind_from_deg=wind_from_deg,
     )
     raw_action, severity = _worst(findings)
     reasons = [f.reason for f in findings if f.action != SafetyAction.ALLOW]
+    divert_target = next(
+        (
+            f.data
+            for f in findings
+            if f.action in (SafetyAction.DIVERT, SafetyAction.LAND_NOW) and f.data
+        ),
+        None,
+    )
 
     new_latch = update_latch(prior_latch, raw_action, snapshot)
     action = raw_action
@@ -821,6 +1090,7 @@ def evaluate(
         checked_at=now,
         latched=new_latch is not None,
         latch_action=new_latch,
+        divert_target=divert_target,
     )
 
 
@@ -849,6 +1119,31 @@ def observed_discharge_rate(
 
 EventSink = Callable[..., object]
 SnapshotSource = Callable[[], TelemetrySnapshot]
+SafeSpotSource = Callable[[], "Sequence[SafeSpot]"]
+
+
+def _default_safe_spots() -> tuple[SafeSpot, ...]:
+    """``config.SAFE_SPOTS_FALLBACK`` as :class:`SafeSpot` objects. Used when
+    nothing wires a live safe-spot source (tests, and any moment before
+    :class:`gss.safe_spots.SafeSpotBook` has loaded its first list)."""
+    out: list[SafeSpot] = []
+    for row in config.SAFE_SPOTS_FALLBACK:
+        try:
+            out.append(
+                SafeSpot(
+                    name=str(row["name"]),
+                    lat=float(row["lat"]),  # type: ignore[arg-type]
+                    lon=float(row["lon"]),  # type: ignore[arg-type]
+                    radius_m=float(row.get("radius_m", 10.0)),  # type: ignore[arg-type]
+                    surface=str(row.get("surface", "open_ground")),
+                    has_marker=bool(row.get("has_marker", False)),
+                    height_above_dock_m=float(row.get("height_above_dock_m", 0.0)),  # type: ignore[arg-type]
+                    marker_id=(str(row["marker_id"]) if row.get("marker_id") else None),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            log.warning("safety: ignoring malformed SAFE_SPOTS_FALLBACK row %r", row)
+    return tuple(out)
 
 
 @dataclass
@@ -879,11 +1174,15 @@ class SafetyMonitor:
         home_lon: float | None = None,
         tick_hz: float | None = None,
         watchdog_s: float | None = None,
+        safe_spots_source: SafeSpotSource | None = None,
     ) -> None:
         self._snapshot_source = snapshot_source
         self._event_sink = event_sink
         self._home_lat = home_lat if home_lat is not None else config.HOME_LAT
         self._home_lon = home_lon if home_lon is not None else config.HOME_LON
+        # Injected, never imported -- gss.safe_spots lives outside this module's
+        # no-network boundary (R1). Defaults to the config fallback.
+        self._safe_spots_source = safe_spots_source or _default_safe_spots
         self._period_s = 1.0 / (tick_hz or config.SAFETY_TICK_HZ)
         self._watchdog_s = watchdog_s if watchdog_s is not None else config.SAFETY_WATCHDOG_S
 
@@ -1017,9 +1316,17 @@ class SafetyMonitor:
 
             prior_latch = state.latch
 
-        eval_context = context or SafetyContext(
+        try:
+            safe_spots = tuple(self._safe_spots_source() or ())
+        except Exception:  # noqa: BLE001 -- the spot source must not break a tick
+            log.exception("safety: safe-spot source failed; using none this tick")
+            safe_spots = ()
+
+        base_context = context or SafetyContext(
             preflight=False, home_lat=self._home_lat, home_lon=self._home_lon
         )
+        eval_context = replace(base_context, safe_spots=safe_spots)
+        wind_speed, wind_from = _observed_wind(snapshot)
         verdict = evaluate(
             snapshot,
             eval_context,
@@ -1027,6 +1334,9 @@ class SafetyMonitor:
             link_down_s=link_down_s,
             gps_bad_s=gps_bad_s,
             discharge_rate_pct_per_s=rate,
+            wind_ms=_observed_headwind_home(snapshot, eval_context),
+            wind_speed_ms=wind_speed,
+            wind_from_deg=wind_from,
             prior_latch=prior_latch,
         )
 
@@ -1097,6 +1407,7 @@ class SafetyMonitor:
                     "severity": verdict.severity.value,
                     "latched": verdict.latched,
                     "reasons": list(verdict.reasons),
+                    "divert_target": verdict.divert_target,
                 },
                 sync=False,
             )

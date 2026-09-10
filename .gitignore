@@ -58,3 +58,11 @@ web/config.js
 # Supabase CLI local state
 supabase/.branches/
 supabase/.temp/
+
+# weather.py forecast cache (v0.5) -- last-good forecast for offline boot
+.weather_cache.json
+.weather_cache.json.tmp
+
+# safe-spot list cache (v0.5.1) -- last known safe spots for offline boot
+.safe_spots_cache.json
+.safe_spots_*.tmp

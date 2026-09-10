@@ -34,6 +34,11 @@ KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 DRONE = os.environ["DRONE_ID"]
 FOREIGN_DRONE = "d5030000-0000-4000-8000-0000000000ff"
 
+# These are the v0.3 command-intake tests. weather.py (v0.5) has its own suite
+# (tests/test_weather.py) with a fake forecast source; it must not reach the
+# real internet from here.
+os.environ.setdefault("WEATHER_ENABLED", "false")
+
 from gss.commands import CommandIntake  # noqa: E402
 from gss.link import MavlinkLink  # noqa: E402
 from gss.store import TelemetryStore  # noqa: E402

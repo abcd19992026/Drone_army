@@ -50,12 +50,16 @@ _MSG_VFR_HUD = mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD
 _MSG_SYS_STATUS = mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS
 _MSG_BATTERY_STATUS = mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS
 _MSG_GPS_RAW_INT = mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT
+_MSG_WIND = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_WIND", 168)
+_MSG_VIBRATION = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_VIBRATION", 241)
 _STREAMABLE = (
     _MSG_GLOBAL_POSITION_INT,
     _MSG_VFR_HUD,
     _MSG_SYS_STATUS,
     _MSG_BATTERY_STATUS,
     _MSG_GPS_RAW_INT,
+    _MSG_WIND,
+    _MSG_VIBRATION,
 )
 
 
@@ -112,6 +116,13 @@ class FakeVehicle:
         self._battery_ca = 0
         self._armed = False
         self._custom_mode = 0  # copter: 0 == STABILIZE
+        # v0.5 observed conditions
+        self._wind_speed_ms = 0.0
+        self._wind_dir_deg = 0.0
+        self._throttle_pct = 0
+        self._climb_ms = 0.0
+        self._vib = (0.0, 0.0, 0.0)
+        self._clip = (0, 0, 0)
 
     # ------------------------------------------------------------------ API
 
@@ -203,6 +214,43 @@ class FakeVehicle:
         with self._lock:
             self._heartbeat_only = bool(value)
 
+    def set_wind(
+        self, speed_ms: float | None = None, direction_deg: float | None = None
+    ) -> None:
+        """Set the EKF wind estimate reported in WIND (direction the wind is
+        coming FROM)."""
+        with self._lock:
+            if speed_ms is not None:
+                self._wind_speed_ms = float(speed_ms)
+            if direction_deg is not None:
+                self._wind_dir_deg = float(direction_deg) % 360.0
+
+    def set_throttle(self, pct: float | None = None, climb_ms: float | None = None) -> None:
+        """Set VFR_HUD throttle (0-100) and/or climb rate."""
+        with self._lock:
+            if pct is not None:
+                self._throttle_pct = int(round(pct))
+            if climb_ms is not None:
+                self._climb_ms = float(climb_ms)
+
+    def set_vibration(
+        self,
+        x: float | None = None,
+        y: float | None = None,
+        z: float | None = None,
+        clip: tuple[int, int, int] | None = None,
+    ) -> None:
+        """Set the VIBRATION levels and, optionally, the clipping counts."""
+        with self._lock:
+            vx, vy, vz = self._vib
+            self._vib = (
+                float(x) if x is not None else vx,
+                float(y) if y is not None else vy,
+                float(z) if z is not None else vz,
+            )
+            if clip is not None:
+                self._clip = (int(clip[0]), int(clip[1]), int(clip[2]))
+
     def suppress_message(self, message_id: int) -> None:
         """Stop streaming just this MAVLink message id. HEARTBEAT and every
         other requested stream keep flowing normally."""
@@ -292,10 +340,19 @@ class FakeVehicle:
                 had_client = False
                 continue
 
-            try:
-                msg = conn.recv_match(blocking=False)
-            except OSError:
-                msg = None
+            # Drain ALL pending incoming messages this iteration, not just one:
+            # the GSS sends its stream requests back-to-back and each waits ~1s
+            # for a COMMAND_ACK, so a one-per-20ms drain rate can time a request
+            # out under load.
+            msgs = []
+            for _ in range(32):
+                try:
+                    m = conn.recv_match(blocking=False)
+                except OSError:
+                    m = None
+                if m is None:
+                    break
+                msgs.append(m)
 
             if conn.port is not None and not had_client:
                 had_client = True
@@ -306,8 +363,9 @@ class FakeVehicle:
                 self._client_seen.clear()
                 log.info("fake vehicle: client disconnected")
 
-            if msg is not None and msg.get_type() != "BAD_DATA":
-                self._handle_incoming(conn, msg)
+            for msg in msgs:
+                if msg.get_type() != "BAD_DATA":
+                    self._handle_incoming(conn, msg)
 
             now = time.monotonic()
             if conn.port is not None:
@@ -380,6 +438,12 @@ class FakeVehicle:
             pct = int(self._battery_pct)
             mv = int(self._battery_mv)
             ca = int(self._battery_ca)
+            wind_speed = float(self._wind_speed_ms)
+            wind_dir = float(self._wind_dir_deg)
+            throttle = int(self._throttle_pct)
+            climb = float(self._climb_ms)
+            vib = self._vib
+            clip = self._clip
         mav = conn.mav
         now_ms = int(time.time() * 1000) & 0xFFFFFFFF
         now_us = int(time.time() * 1e6) & 0xFFFFFFFFFFFFFFFF
@@ -391,7 +455,7 @@ class FakeVehicle:
                 now_ms, lat, lon, alt_mm, rel_mm, 0, 0, 0, hdg_cdeg))
         if self._wants(_MSG_VFR_HUD):
             self._safe_send(conn, lambda: mav.vfr_hud_send(
-                gs, gs, int(hdg_cdeg / 100), 0, alt_amsl_m, 0.0))
+                gs, gs, int(hdg_cdeg / 100), throttle, alt_amsl_m, climb))
         if self._wants(_MSG_SYS_STATUS):
             self._safe_send(conn, lambda: mav.sys_status_send(
                 0, 0, 0, 0, mv, ca, pct, 0, 0, 0, 0, 0, 0))
@@ -401,6 +465,12 @@ class FakeVehicle:
         if self._wants(_MSG_GPS_RAW_INT):
             self._safe_send(conn, lambda: mav.gps_raw_int_send(
                 now_us, fix, lat, lon, alt_mm, 121, 200, 0, 0, sats))
+        if self._wants(_MSG_WIND):
+            # WIND: direction wind comes FROM (deg), horizontal speed, vertical.
+            self._safe_send(conn, lambda: mav.wind_send(wind_dir, wind_speed, 0.0))
+        if self._wants(_MSG_VIBRATION):
+            self._safe_send(conn, lambda: mav.vibration_send(
+                now_us, vib[0], vib[1], vib[2], clip[0], clip[1], clip[2]))
 
     def _safe_send(self, conn: mavutil.mavfile, send_fn: Any) -> None:
         try:

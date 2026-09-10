@@ -190,6 +190,88 @@ GPS_LOSS_GRACE_S: float = _get_float("GPS_LOSS_GRACE_S", 15.0)
 LINK_LOSS_GRACE_S: float = _get_float("LINK_LOSS_GRACE_S", 30.0)
 DISCHARGE_WINDOW_S: float = _get_float("DISCHARGE_WINDOW_S", 60.0)
 
+# --- weather.py (v0.5) -------------------------------------------------------
+# Same R1 reason as the safety block above: weather.py is imported on the same
+# side of the network boundary as safety.py, so its thresholds live here, not
+# in system_config.
+#
+# EVERY threshold below is a STARTING POINT, not a measured truth. These are
+# estimates for a ~3 kg hexacopter with large, slow props -- an airframe that
+# does not exist yet. Its real limits are discovered by flying it, carefully,
+# on a day you are willing to lose it. Tune these against flight logs from the
+# real machine and nothing else.
+#
+# WEATHER_ENABLED=false makes the GSS behave exactly as v0.4 did: no feed, no
+# WeatherMonitor, no weather branch anywhere.
+WEATHER_ENABLED: bool = _get_bool("WEATHER_ENABLED", True)
+WEATHER_PROVIDER_URL: str = _get_str(
+    "WEATHER_PROVIDER_URL", "https://api.open-meteo.com/v1/forecast"
+)
+WEATHER_FETCH_INTERVAL_S: float = _get_float("WEATHER_FETCH_INTERVAL_S", 600.0)
+WEATHER_MAX_AGE_S: float = _get_float("WEATHER_MAX_AGE_S", 3600.0)
+WEATHER_CONFIRM_TIMEOUT_S: float = _get_float("WEATHER_CONFIRM_TIMEOUT_S", 120.0)
+WEATHER_WARN_GRACE_S: float = _get_float("WEATHER_WARN_GRACE_S", 60.0)
+WEATHER_CACHE_PATH: str = _get_str("WEATHER_CACHE_PATH", ".weather_cache.json")
+
+WIND_MARGINAL_MS: float = _get_float("WIND_MARGINAL_MS", 8.0)
+WIND_SEVERE_MS: float = _get_float("WIND_SEVERE_MS", 12.0)
+GUST_MARGINAL_MS: float = _get_float("GUST_MARGINAL_MS", 10.0)
+GUST_SEVERE_MS: float = _get_float("GUST_SEVERE_MS", 14.0)
+PRECIP_MARGINAL_MMH: float = _get_float("PRECIP_MARGINAL_MMH", 0.2)
+PRECIP_SEVERE_MMH: float = _get_float("PRECIP_SEVERE_MMH", 2.0)
+VISIBILITY_MIN_M: float = _get_float("VISIBILITY_MIN_M", 1000.0)
+TEMP_MIN_C: float = _get_float("TEMP_MIN_C", 0.0)
+TEMP_MAX_C: float = _get_float("TEMP_MAX_C", 45.0)
+LIGHTNING_RADIUS_KM: float = _get_float("LIGHTNING_RADIUS_KM", 15.0)
+THROTTLE_MARGIN_MIN_PCT: float = _get_float("THROTTLE_MARGIN_MIN_PCT", 15.0)
+VIBRATION_SEVERE: float = _get_float("VIBRATION_SEVERE", 30.0)
+EMERGENCY_MISSION_TYPES: frozenset[str] = frozenset(
+    t.strip()
+    for t in _get_str(
+        "EMERGENCY_MISSION_TYPES", "summon,family_summon,search,accident"
+    ).split(",")
+    if t.strip()
+)
+
+# --- safe spots + the unreachable-home divert (v0.5.1) --------------------
+# safety.py's point-of-no-return check answers "can it still get home?". When
+# the headwind-aware return budget climbs above RETURN_BUDGET_IMPOSSIBLE_PCT --
+# or simply above the battery left plus the reserve -- home is NOT reachable,
+# and sending the aircraft home anyway means it runs out somewhere along the
+# way, under power, over whatever is beneath it. The verdict then is DIVERT:
+# fly to the nearest reachable known safe spot and land there. A controlled
+# landing in the wrong place beats an uncontrolled arrival in a random one.
+#
+# These live HERE and not in system_config for the same R1 reason as the
+# safety / weather blocks above: safety.py must decide with no network. Every
+# number is a STARTING POINT for an airframe that does not exist yet.
+RETURN_BUDGET_IMPOSSIBLE_PCT: float = _get_float("RETURN_BUDGET_IMPOSSIBLE_PCT", 95.0)
+SAFE_SPOT_REFRESH_S: float = _get_float("SAFE_SPOT_REFRESH_S", 300.0)
+SAFE_SPOT_MAX_DISTANCE_M: float = _get_float("SAFE_SPOT_MAX_DISTANCE_M", 6000.0)
+SAFE_SPOT_CACHE_PATH: str = _get_str("SAFE_SPOT_CACHE_PATH", ".safe_spots_cache.json")
+
+# Two tiers of safe spot. A spot WITH an ArUco marker can be landed on
+# accurately by the vision pipeline, so a small pad is fine. A spot WITHOUT a
+# marker is GPS-only -- 3-10 m of error in the open, worse between buildings --
+# so it must be a genuinely clear circle of at least SAFE_SPOT_MIN_GPS_RADIUS_M,
+# and the selection function REJECTS a non-marker spot whose row claims less
+# rather than trusting the number. A marker pad is worth up to
+# SAFE_SPOT_MARKER_PREFERENCE_M of extra battery distance over a GPS-only spot.
+SAFE_SPOT_MIN_GPS_RADIUS_M: float = _get_float("SAFE_SPOT_MIN_GPS_RADIUS_M", 20.0)
+SAFE_SPOT_MARKER_PREFERENCE_M: float = _get_float("SAFE_SPOT_MARKER_PREFERENCE_M", 1000.0)
+
+# safety.py cannot read the database (R1). gss/safe_spots.py loads the spot
+# list from Supabase at startup and every SAFE_SPOT_REFRESH_S, caches it to
+# disk for an offline boot, and falls back to this list so it is NEVER empty --
+# even on first run with no database and no cache. At minimum: the dock itself,
+# an open, already-mapped place to put the aircraft down. Real spots are added
+# later, from the ground, by a human who has looked at the place. Keep the
+# coordinates in sync with HOME_LAT / HOME_LON.
+SAFE_SPOTS_FALLBACK: tuple[dict[str, object], ...] = (
+    {"name": "dock", "lat": HOME_LAT, "lon": HOME_LON, "radius_m": 10.0,
+     "surface": "open_ground", "has_marker": True, "height_above_dock_m": 0.0},
+)
+
 # --- Logging ---------------------------------------------------------------
 LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
 
@@ -377,6 +459,87 @@ def _validate() -> None:
         errors.append(
             f"MIN_ALT_M ({MIN_ALT_M}) must be below MAX_ALT_M ({MAX_ALT_M})"
         )
+
+    # --- weather.py (v0.5) ---
+    for name, value in (
+        ("WEATHER_FETCH_INTERVAL_S", WEATHER_FETCH_INTERVAL_S),
+        ("WEATHER_MAX_AGE_S", WEATHER_MAX_AGE_S),
+        ("WEATHER_CONFIRM_TIMEOUT_S", WEATHER_CONFIRM_TIMEOUT_S),
+        ("WEATHER_WARN_GRACE_S", WEATHER_WARN_GRACE_S),
+        ("WIND_MARGINAL_MS", WIND_MARGINAL_MS),
+        ("WIND_SEVERE_MS", WIND_SEVERE_MS),
+        ("GUST_MARGINAL_MS", GUST_MARGINAL_MS),
+        ("GUST_SEVERE_MS", GUST_SEVERE_MS),
+        ("VISIBILITY_MIN_M", VISIBILITY_MIN_M),
+        ("LIGHTNING_RADIUS_KM", LIGHTNING_RADIUS_KM),
+        ("VIBRATION_SEVERE", VIBRATION_SEVERE),
+    ):
+        if value <= 0:
+            errors.append(f"{name} must be positive, got {value}")
+    for name, value in (
+        ("PRECIP_MARGINAL_MMH", PRECIP_MARGINAL_MMH),
+        ("PRECIP_SEVERE_MMH", PRECIP_SEVERE_MMH),
+    ):
+        if value < 0:
+            errors.append(f"{name} must not be negative, got {value}")
+    if WIND_MARGINAL_MS >= WIND_SEVERE_MS:
+        errors.append(
+            f"WIND_MARGINAL_MS ({WIND_MARGINAL_MS}) must be below WIND_SEVERE_MS "
+            f"({WIND_SEVERE_MS})"
+        )
+    if GUST_MARGINAL_MS >= GUST_SEVERE_MS:
+        errors.append(
+            f"GUST_MARGINAL_MS ({GUST_MARGINAL_MS}) must be below GUST_SEVERE_MS "
+            f"({GUST_SEVERE_MS})"
+        )
+    if PRECIP_MARGINAL_MMH >= PRECIP_SEVERE_MMH:
+        errors.append(
+            f"PRECIP_MARGINAL_MMH ({PRECIP_MARGINAL_MMH}) must be below "
+            f"PRECIP_SEVERE_MMH ({PRECIP_SEVERE_MMH})"
+        )
+    if TEMP_MIN_C >= TEMP_MAX_C:
+        errors.append(
+            f"TEMP_MIN_C ({TEMP_MIN_C}) must be below TEMP_MAX_C ({TEMP_MAX_C})"
+        )
+    if not 0.0 < THROTTLE_MARGIN_MIN_PCT < 100.0:
+        errors.append(
+            f"THROTTLE_MARGIN_MIN_PCT out of range (0, 100): {THROTTLE_MARGIN_MIN_PCT}"
+        )
+    if WEATHER_MAX_AGE_S <= WEATHER_FETCH_INTERVAL_S:
+        errors.append(
+            f"WEATHER_MAX_AGE_S ({WEATHER_MAX_AGE_S}) must exceed "
+            f"WEATHER_FETCH_INTERVAL_S ({WEATHER_FETCH_INTERVAL_S}) -- a forecast "
+            f"would be stale before the next fetch"
+        )
+    if WEATHER_ENABLED and not WEATHER_PROVIDER_URL.startswith(("http://", "https://")):
+        errors.append(
+            f"WEATHER_PROVIDER_URL must be an http(s) URL, got {WEATHER_PROVIDER_URL!r}"
+        )
+    if not EMERGENCY_MISSION_TYPES:
+        errors.append("EMERGENCY_MISSION_TYPES must not be empty")
+
+    # --- safe spots + the unreachable-home divert (v0.5.1) ---
+    if not 0.0 < RETURN_BUDGET_IMPOSSIBLE_PCT <= 100.0:
+        errors.append(
+            f"RETURN_BUDGET_IMPOSSIBLE_PCT out of range (0, 100]: "
+            f"{RETURN_BUDGET_IMPOSSIBLE_PCT}"
+        )
+    for name, value in (
+        ("SAFE_SPOT_REFRESH_S", SAFE_SPOT_REFRESH_S),
+        ("SAFE_SPOT_MAX_DISTANCE_M", SAFE_SPOT_MAX_DISTANCE_M),
+        ("SAFE_SPOT_MIN_GPS_RADIUS_M", SAFE_SPOT_MIN_GPS_RADIUS_M),
+        ("SAFE_SPOT_MARKER_PREFERENCE_M", SAFE_SPOT_MARKER_PREFERENCE_M),
+    ):
+        if value <= 0:
+            errors.append(f"{name} must be positive, got {value}")
+    if not SAFE_SPOTS_FALLBACK:
+        errors.append(
+            "SAFE_SPOTS_FALLBACK must contain at least the dock -- the safe-spot "
+            "list may never be empty (R1: safety.py must always have an answer)"
+        )
+    for _spot in SAFE_SPOTS_FALLBACK:
+        if not {"name", "lat", "lon"} <= set(_spot):
+            errors.append(f"SAFE_SPOTS_FALLBACK row missing name/lat/lon: {_spot}")
 
     if ALLOW_VEHICLE_CONTROL:
         # Hard stop. There is no vehicle-control executor before v0.5, and no

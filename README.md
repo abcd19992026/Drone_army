@@ -7,21 +7,51 @@ production; for now it runs on Windows against ArduPilot SITL.
 **Scope so far:** MAVLink link with forever-reconnect and telemetry to the
 console; a best-effort Supabase mirror of the telemetry plus a live status
 page (v0.2); command intake -> **dry-run** missions (v0.3); `safety.py`, the
-veto authority (v0.4). The GSS transmits nothing over MAVLink but telemetry
-stream-rate requests (send boundary at the top of `gss/link.py`, rule **R11**);
-network calls live in `gss/store.py` and `gss/commands.py` and never block the
-flight path (rule **R10**). It does not arm, change mode, take off, or send a
-waypoint -- v0.3 walks accepted missions through their states on a timer and
-logs what a real flight *would* do, and v0.4 can veto and interrupt them. A
-real executor (v0.5) comes next. See `PROJECT.md`.
+veto authority (v0.4); `weather.py`, conditions awareness and the
+stay-or-return decision (v0.5). The GSS transmits nothing over MAVLink but
+telemetry stream-rate requests (send boundary at the top of `gss/link.py`,
+rule **R11**); network calls live in `gss/store.py`, `gss/commands.py` and
+`gss/weather_feed.py` and never block the flight path (rule **R10**). It does
+not arm, change mode, take off, or send a waypoint -- missions still walk their
+states on a timer and log what a real flight *would* do, now with safety.py
+able to veto/interrupt and weather.py able to hold, extend, or turn one back. A
+real executor (v0.6) comes next. See `PROJECT.md`.
+
+**weather.py (v0.5):** a pure core (conditions in, verdict out -- no I/O, no
+clock reads, no network import) plus `gss/weather_feed.py`, the networked
+fetcher kept on the far side of that boundary. The default flips on mission
+type: for a **routine** mission (patrol/inspect/survey/test) deteriorating
+weather means GO HOME; for an **emergency** mission (summon/family_summon/
+search/accident) it means STAY and keep working, leaving only when conditions
+reach SEVERE (unflyable) or a human explicitly recalls it. Authority order is
+`safety.py > weather.py > commands > the human` -- weather can only make the
+system more conservative, and never overrides a safety.py verdict. Pre-flight
+uses the internet forecast (Open-Meteo, keyless; cached to disk); in flight it
+classifies from the aircraft's OWN measurements (WIND, VIBRATION, VFR_HUD
+throttle -- R1: no internet while airborne). Lightning within
+`LIGHTNING_RADIUS_KM` is SEVERE with no emergency exception. The observed wind
+feeds safety.py's point-of-no-return as a headwind component. New command types
+`weather_continue` / `weather_recall`; new mission status `awaiting_confirmation`;
+new `mission_events` `weather_warning` / `weather_hold` / `weather_return` /
+`weather_launch_blocked`; `alerts` rows written for the (later) notification
+channel. `WEATHER_ENABLED=false` runs exactly as v0.4.
 
 **safety.py (v0.4):** a pure decision core (state in, verdict out -- no I/O, no
 clock reads) wrapped in a thin loop thread (`SafetyMonitor`) at
 `SAFETY_TICK_HZ`, with a watchdog on itself. It answers two questions: may this
 command start a flight (pre-flight `REJECT`/`ALLOW`), and given the state right
 now must the drone do something else
-(`WARN`/`HOLD`/`DESCEND`/`RTL_NOW`/`LAND_NOW`). It is the final authority -- no
-override, no bypass. It **fails safe** (any check it cannot evaluate -> DENY,
+(`WARN`/`HOLD`/`DESCEND`/`RTL_NOW`/`DIVERT`/`LAND_NOW`). It is the final
+authority -- no override, no bypass. When the headwind-aware point-of-no-return
+budget says home is not reachable, the verdict is **`DIVERT`** -- fly to the
+nearest reachable safe spot (`safe_spots` table + a disk cache + a config
+fallback of at least the dock; safety.py gets the list as plain data, never
+reads the DB) -- or **`LAND_NOW`** if nothing is reachable. Safe spots are two
+tiers: an ArUco-marker pad lands accurately (a small pad is fine, and it is
+preferred over a closer GPS-only spot by up to `SAFE_SPOT_MARKER_PREFERENCE_M`);
+a GPS-only spot must be a real clear circle of `SAFE_SPOT_MIN_GPS_RADIUS_M` and
+at dock level, or the selector refuses it. It **fails safe** (any check it
+cannot evaluate -> DENY,
 rule **R12**), its critical verdicts **latch** until the drone is on the ground
 and disarmed (rule **R13**), and it imports **no** network and **no** database
 code, directly or transitively (rule **R1**; `tests/test_safety.py` asserts the
@@ -45,6 +75,9 @@ gss/
   commands.py     CommandIntake: Realtime + poller -> claim -> validate -> dry-run mission
   executor.py     Executor interface + DryRunExecutor (v0.3) + make_executor()
   safety.py       the veto authority (v0.4): pure decision core + SafetyMonitor loop
+  safe_spots.py   the divert-target list (v0.5.1): DB + disk cache + config fallback (outside R1)
+  weather.py      conditions awareness (v0.5): pure classification + stay-or-return
+  weather_feed.py the networked forecast fetcher + WeatherMonitor (outside the R1 boundary)
   main.py         entry point: wire it together, print a line every 2s
 supabase/
   migrations/     the schema -- the source of truth (apply with the Supabase CLI)
@@ -57,6 +90,7 @@ tests/
   test_store.py       store.py vs a local mock HTTP endpoint (24)
   test_commands.py    v0.3 command intake vs the real Supabase project in .env (37)
   test_safety.py      v0.4 safety: pure scenario table + shell + import boundary + live layer
+  test_weather.py     v0.5 weather: classification table + decisions + feed + boundary + live layer
 ```
 
 ## Setup (Windows)

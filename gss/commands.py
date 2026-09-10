@@ -51,9 +51,12 @@ from gss.executor import (
     MissionPhase,
     make_executor,
 )
+from gss import config, weather
 from gss.safety import SafetyAction, SafetyContext, SafetyMonitor
 from gss.store import TelemetryStore
 from gss.telemetry import TelemetrySnapshot
+from gss.weather import WeatherAction, WeatherTier
+from gss.weather_feed import WeatherMonitor
 
 log = logging.getLogger(__name__)
 
@@ -63,6 +66,7 @@ _SAFETY_ACTIONABLE = frozenset(
         SafetyAction.HOLD,
         SafetyAction.DESCEND,
         SafetyAction.RTL_NOW,
+        SafetyAction.DIVERT,
         SafetyAction.LAND_NOW,
     }
 )
@@ -73,7 +77,7 @@ _KNOWN_COMMAND_TYPES = frozenset({
     "set_altitude", "set_heading", "nudge", "orbit", "set_roi", "photo",
     "start_recording", "stop_recording", "panorama", "follow_me",
     "spotlight_on", "spotlight_off", "siren_on", "siren_off", "speaker_talk",
-    "drop_release", "find_my_drone",
+    "drop_release", "find_my_drone", "weather_continue", "weather_recall",
 })
 # What v0.3 actually acts on. Everything else known -> rejected "not handled yet".
 _FLIGHT_COMMAND_TYPES = frozenset({"summon", "goto"})
@@ -151,6 +155,24 @@ class _ActiveMission:
     last_phase: MissionPhase = MissionPhase.QUEUED
     duration_abort_sent: bool = False
     last_safety_action: SafetyAction | None = None
+    # weather (v0.5)
+    is_emergency: bool = False
+    weather_warn_since_mono: float | None = None
+    weather_last_action: WeatherAction | None = None
+    weather_continue: bool = False
+    weather_recalled: bool = False
+
+
+@dataclass
+class _AwaitingConfirmation:
+    """A routine mission held pre-flight while a human decides whether to
+    launch into marginal weather (v0.5)."""
+
+    mission_id: str
+    command_id: str
+    command: dict
+    reasons: tuple[str, ...]
+    deadline_mono: float
 
 
 class _RealtimeSubscriber:
@@ -284,6 +306,7 @@ class CommandIntake:
         executor_factory=make_executor,
         realtime_enabled: bool = True,
         safety: SafetyMonitor | None = None,
+        weather: WeatherMonitor | None = None,
     ) -> None:
         self._store = store
         self._snapshot = snapshot_source
@@ -328,10 +351,28 @@ class CommandIntake:
             home_lon=self._home_lon,
         )
 
+        # weather.py (v0.5): can make the system MORE conservative, never less,
+        # and never overrides safety. Absent entirely when WEATHER_ENABLED is
+        # false -- then every weather branch below is skipped and behaviour is
+        # exactly v0.4.
+        self._owns_weather = weather is None and config.WEATHER_ENABLED
+        if weather is not None:
+            self._weather: WeatherMonitor | None = weather
+        elif config.WEATHER_ENABLED:
+            self._weather = WeatherMonitor(
+                snapshot_source,
+                lat=self._home_lat,
+                lon=self._home_lon,
+                event_sink=(store.log_event if store is not None else None),
+            )
+        else:
+            self._weather = None
+
         self._stop = threading.Event()
         self._inbox: queue.Queue[str] = queue.Queue()
         self._seen = _RecentIds(_RECENT_IDS_CAP)
         self._active: _ActiveMission | None = None
+        self._awaiting: _AwaitingConfirmation | None = None
         self._active_lock = threading.Lock()
         self._retry_status: dict[str, tuple[str, str | None]] = {}
         self._retry_lock = threading.Lock()
@@ -350,6 +391,8 @@ class CommandIntake:
     def start(self) -> None:
         if self._owns_safety:
             self._safety.start()
+        if self._owns_weather and self._weather is not None:
+            self._weather.start()
         self._threads = [
             threading.Thread(target=self._handler_loop, name="cmd-handler", daemon=True),
             threading.Thread(target=self._poll_loop, name="cmd-poller", daemon=True),
@@ -387,6 +430,7 @@ class CommandIntake:
             thread.join(timeout=max(0.05, deadline - time.monotonic()))
         with self._active_lock:
             active = self._active
+            awaiting = self._awaiting
         if active is not None:
             self._store.update_mission(
                 active.mission_id, status="aborted",
@@ -394,6 +438,14 @@ class CommandIntake:
             )
             self._store.update_command_status(active.command_id, "done")
             self._active = None
+        if awaiting is not None:
+            self._store.update_mission(
+                awaiting.mission_id, status="aborted",
+                abort_reason="GSS stopped while awaiting weather confirmation",
+            )
+            self._store.update_command_status(awaiting.command_id, "rejected",
+                                              rejected_reason="GSS stopped before launch")
+            self._awaiting = None
         with self._retry_lock:
             leftover = dict(self._retry_status)
         if leftover:
@@ -404,6 +456,10 @@ class CommandIntake:
         self._safety.set_context(None)
         if self._owns_safety:
             self._safety.close(timeout_s=max(0.1, deadline - time.monotonic()))
+        if self._weather is not None:
+            self._weather.end_mission()
+            if self._owns_weather:
+                self._weather.close(timeout_s=max(0.1, deadline - time.monotonic()))
         log.info("command intake stopped")
 
     @property
@@ -462,11 +518,25 @@ class CommandIntake:
         if ctype == "hold":
             self._handle_hold(cmd, server_now)
             return
+        if ctype == "weather_continue":
+            self._handle_weather_answer(cmd, server_now, recall=False)
+            return
+        if ctype == "weather_recall":
+            self._handle_weather_answer(cmd, server_now, recall=True)
+            return
 
         reason = self._validate_flight(cmd, server_now)
         if reason is not None:
             self._reject(command_id, reason)
             return
+
+        # Weather pre-flight gate. safety.py (inside _validate_flight) has
+        # already had the final say; weather can only make this MORE
+        # conservative -- hold a routine launch for a human, or refuse.
+        if self._weather is not None:
+            if self._weather_preflight(cmd):
+                return  # blocked or now awaiting confirmation
+
         self._accept_flight(cmd)
 
     # ---------------------------------------------------------- validation
@@ -541,13 +611,19 @@ class CommandIntake:
                 f"command while blind"
             )
 
-        # 8. no mission already active for this drone
+        # 8. no mission already active (or held for weather confirmation)
         with self._active_lock:
             active = self._active
+            awaiting = self._awaiting
         if active is not None:
             return (
                 f"a {active.command.get('type')} mission is already running "
                 f"(mission {active.mission_id}); a second one is rejected, not queued"
+            )
+        if awaiting is not None:
+            return (
+                f"a mission (mission {awaiting.mission_id}) is awaiting a weather "
+                f"decision; a second flight command is rejected, not queued"
             )
 
         # 9. safety.py has the FINAL say. Everything above is intake sanity --
@@ -563,7 +639,7 @@ class CommandIntake:
 
     # ---------------------------------------------------------- accept
 
-    def _accept_flight(self, cmd: dict) -> None:
+    def _accept_flight(self, cmd: dict, *, weather_note: tuple[str, ...] | None = None) -> None:
         command_id = cmd["id"]
         mission_type = _MISSION_TYPE_FOR[cmd["type"]]
         cruise_alt = cmd.get("target_alt_m") or self._on_station_alt_m
@@ -593,19 +669,44 @@ class CommandIntake:
             },
             sync=True,
         )
+        if weather_note is not None:
+            # An emergency mission launching into MARGINAL conditions. No
+            # confirmation was requested (a person in danger will not fill in a
+            # form); record that it launched anyway and why.
+            self._store.log_event(
+                mission_id, "weather_warning",
+                detail={"dry_run": True, "launched_into": "marginal",
+                        "reasons": list(weather_note)},
+                sync=True,
+            )
+            log.warning(
+                "mission %s: EMERGENCY -- launching into MARGINAL weather, no "
+                "confirmation asked: %s", mission_id, "; ".join(weather_note),
+            )
 
+        self._start_executor(cmd, mission_id, mission_type, command_id)
+        log.info(
+            "command %s ACCEPTED -> mission %s (%s). DRY RUN begins.",
+            command_id, mission_id, mission_type,
+        )
+
+    def _start_executor(
+        self, cmd: dict, mission_id: str, mission_type: str, command_id: str
+    ) -> None:
+        """Build the executor, register the mission as active, and start it.
+        Shared by a fresh accept and a launch-after-weather-confirmation."""
         executor = self._executor_factory(
             mission_id, cmd, self._snapshot,
             allow_vehicle_control=self._allow_vehicle_control,
             on_station_alt_m=self._on_station_alt_m,
         )
         if not isinstance(executor, DryRunExecutor):
-            # Belt-and-suspenders with config._validate() and the factory.
             raise RuntimeError(
-                "refusing a non-dry-run executor in v0.3 "
+                "refusing a non-dry-run executor in v0.5 "
                 f"(got {type(executor).__name__})"
             )
 
+        is_emergency = weather.is_emergency_mission(mission_type)
         self._store.update_command_status(command_id, "executing")
         with self._active_lock:
             self._active = _ActiveMission(
@@ -614,13 +715,12 @@ class CommandIntake:
                 command=cmd,
                 executor=executor,
                 started_mono=time.monotonic(),
+                is_emergency=is_emergency,
             )
         self._safety.set_context(self._safety_context(cmd, mission_id, MissionPhase.QUEUED))
+        if self._weather is not None:
+            self._weather.begin_mission()
         executor.start()
-        log.info(
-            "command %s ACCEPTED -> mission %s (%s). DRY RUN begins.",
-            command_id, mission_id, mission_type,
-        )
 
     def _safety_context(
         self, cmd: dict, mission_id: str, phase: MissionPhase
@@ -640,6 +740,296 @@ class CommandIntake:
             human_lat=params.get("human_lat"),
             human_lon=params.get("human_lon"),
         )
+
+    # ---------------------------------------------------------- weather (v0.5)
+
+    def _weather_preflight(self, cmd: dict) -> bool:
+        """Consult weather.py before launch. Returns True if it took over the
+        command (blocked it, or put the mission into awaiting_confirmation);
+        False to let _accept_flight proceed (possibly with a note)."""
+        now = datetime.now(timezone.utc)
+        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        is_emergency = weather.is_emergency_mission(mission_type)
+        verdict = self._weather.forecast_verdict(now=now)
+        decision = weather.preflight_decision(
+            verdict, is_emergency=is_emergency, now=now
+        )
+        log.info(
+            "command %s: weather pre-flight %s / %s (emergency=%s) -- %s",
+            cmd["id"], decision.action.value, decision.tier.value, is_emergency,
+            "; ".join(decision.reasons) or "clear",
+        )
+        if decision.action == WeatherAction.ALLOW:
+            if decision.tier == WeatherTier.CLEAR:
+                return False
+            # emergency into marginal -- launch now, _accept_flight logs it
+            self._accept_flight(cmd, weather_note=decision.reasons)
+            return True
+        if decision.action == WeatherAction.CONFIRM:
+            self._begin_awaiting_confirmation(cmd, decision)
+            return True
+        # BLOCK
+        self._weather_block(cmd, decision)
+        return True
+
+    def _begin_awaiting_confirmation(self, cmd: dict, decision) -> None:
+        command_id = cmd["id"]
+        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        mission_id = self._store.create_mission(
+            drone_id=self._drone_id, dock_id=self._dock_id, mission_type=mission_type,
+            target_lat=cmd.get("target_lat"), target_lon=cmd.get("target_lon"),
+            cruise_alt_m=cmd.get("target_alt_m") or self._on_station_alt_m,
+            triggered_by=cmd.get("issued_by") or "command",
+        )
+        if mission_id is None:
+            self._reject(command_id, "internal error: could not create the mission")
+            return
+        self._store.link_command_to_mission(command_id, mission_id)
+        self._store.update_mission(mission_id, status="awaiting_confirmation")
+        self._store.log_event(
+            mission_id, "weather_warning",
+            detail={"dry_run": True, "stage": "pre-flight", "tier": decision.tier.value,
+                    "reasons": list(decision.reasons),
+                    "confirm_timeout_s": config.WEATHER_CONFIRM_TIMEOUT_S},
+            sync=True,
+        )
+        self._write_weather_alert(
+            mission_id, kind="awaiting_confirmation", decision=decision,
+        )
+        self._store.update_command_status(command_id, "executing")
+        with self._active_lock:
+            self._awaiting = _AwaitingConfirmation(
+                mission_id=mission_id, command_id=command_id, command=cmd,
+                reasons=decision.reasons,
+                deadline_mono=time.monotonic() + config.WEATHER_CONFIRM_TIMEOUT_S,
+            )
+        log.warning(
+            "command %s: routine mission, weather MARGINAL -> mission %s "
+            "awaiting_confirmation for up to %.0fs: %s",
+            command_id, mission_id, config.WEATHER_CONFIRM_TIMEOUT_S,
+            "; ".join(decision.reasons),
+        )
+
+    def _weather_block(self, cmd: dict, decision) -> None:
+        command_id = cmd["id"]
+        reason = "weather SEVERE -- not flyable: " + "; ".join(decision.reasons)
+        if decision.is_emergency:
+            # The worst possible outcome here is a SILENT refusal. Someone
+            # needs to know help is not on the way.
+            log.critical(
+                "EMERGENCY MISSION REFUSED -- weather SEVERE. NO DRONE IS COMING. "
+                "command %s. %s", command_id, "; ".join(decision.reasons),
+            )
+            self._write_weather_alert(None, kind="emergency_refused", decision=decision)
+        else:
+            log.error(
+                "routine mission refused -- weather SEVERE. command %s. %s",
+                command_id, "; ".join(decision.reasons),
+            )
+            self._write_weather_alert(None, kind="launch_blocked", decision=decision)
+        self._reject(command_id, reason)
+
+    def _handle_weather_answer(
+        self, cmd: dict, server_now: datetime, *, recall: bool
+    ) -> None:
+        command_id = cmd["id"]
+        expired = self._expiry_reason(cmd, server_now)
+        if expired:
+            self._reject(command_id, expired)
+            return
+        mid = cmd.get("mission_id") or (
+            cmd.get("params", {}) or {}
+        ).get("mission_id")
+        verb = "weather_recall" if recall else "weather_continue"
+        if not mid:
+            self._reject(command_id, f"{verb} requires the mission_id it answers")
+            return
+        with self._active_lock:
+            active = self._active
+            awaiting = self._awaiting
+
+        if awaiting is not None and awaiting.mission_id == mid:
+            if recall:
+                self._cancel_awaiting(awaiting, "recalled by the operator before launch")
+                self._set_status(command_id, "done")
+                return
+            self._launch_awaiting(awaiting)
+            self._set_status(command_id, "done")
+            return
+
+        if active is not None and active.mission_id == mid:
+            with self._active_lock:
+                if recall:
+                    active.weather_recalled = True
+                else:
+                    active.weather_continue = True
+            log.warning(
+                "mission %s: operator %s (command %s)",
+                mid, "RECALL" if recall else "CONTINUE", command_id,
+            )
+            self._set_status(command_id, "done")
+            return
+
+        self._reject(
+            command_id,
+            f"mission {mid} is not awaiting a decision and is not running -- it has "
+            f"already ended; nothing to {'recall' if recall else 'continue'}",
+        )
+
+    def _launch_awaiting(self, awaiting: _AwaitingConfirmation) -> None:
+        cmd = awaiting.command
+        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        with self._active_lock:
+            self._awaiting = None
+        self._store.log_event(
+            awaiting.mission_id, "weather_warning",
+            detail={"dry_run": True, "stage": "pre-flight",
+                    "note": "operator confirmed launch into marginal conditions"},
+            sync=True,
+        )
+        self._start_executor(cmd, awaiting.mission_id, mission_type, awaiting.command_id)
+        log.warning(
+            "command %s CONFIRMED by operator -> mission %s launching into "
+            "marginal weather. DRY RUN begins.",
+            awaiting.command_id, awaiting.mission_id,
+        )
+
+    def _cancel_awaiting(self, awaiting: _AwaitingConfirmation, why: str) -> None:
+        with self._active_lock:
+            if self._awaiting is awaiting:
+                self._awaiting = None
+        self._store.log_event(
+            awaiting.mission_id, "weather_launch_blocked",
+            detail={"dry_run": True, "reason": why, "conditions": list(awaiting.reasons)},
+            sync=True,
+        )
+        self._store.update_mission(
+            awaiting.mission_id, status="aborted",
+            abort_reason=f"weather: {why}",
+        )
+        self._set_status(awaiting.command_id, "rejected",
+                         reason=f"weather: {why} ({'; '.join(awaiting.reasons)})")
+        log.warning("mission %s cancelled before launch -- %s", awaiting.mission_id, why)
+
+    def _write_weather_alert(self, mission_id: str | None, *, kind: str, decision) -> None:
+        snap = self._snapshot()
+        self._store.create_alert(
+            mission_id=mission_id,
+            detail={
+                "kind": kind,
+                "tier": decision.tier.value,
+                "action": decision.action.value,
+                "is_emergency": decision.is_emergency,
+                "reasons": list(decision.reasons),
+                "measured": {
+                    "wind_speed_ms": snap.wind_speed_ms,
+                    "throttle_pct": snap.throttle_pct,
+                },
+                "no_drone_is_coming": kind == "emergency_refused",
+            },
+        )
+
+    def _consult_weather(self, active: _ActiveMission) -> None:
+        """Every supervisor tick, AFTER safety (safety wins). Classify from the
+        aircraft's own measurements and act: WARN -> log; STAY -> log; RETURN
+        -> weather_return event + alert row + abort the dry run."""
+        if self._weather is None:
+            return
+        now = datetime.now(timezone.utc)
+        verdict = self._weather.observed_verdict(now=now)
+
+        mono = time.monotonic()
+        if verdict.tier == WeatherTier.CLEAR:
+            active.weather_warn_since_mono = None
+        elif active.weather_warn_since_mono is None:
+            active.weather_warn_since_mono = mono
+        warn_elapsed = (
+            0.0 if active.weather_warn_since_mono is None
+            else mono - active.weather_warn_since_mono
+        )
+
+        decision = weather.inflight_decision(
+            verdict,
+            is_emergency=active.is_emergency,
+            warn_elapsed_s=warn_elapsed,
+            now=now,
+            human_recalled=active.weather_recalled,
+            human_continue=active.weather_continue,
+        )
+
+        # RETURN always acts; other actions act once per distinct action.
+        if decision.action != WeatherAction.RETURN and decision.action == active.weather_last_action:
+            return
+        prev = active.weather_last_action
+        active.weather_last_action = decision.action
+        reasons = "; ".join(decision.reasons) or decision.tier.value
+
+        if decision.action == WeatherAction.ALLOW:
+            if prev is not None:
+                log.info("mission %s: weather back to acceptable (%s)",
+                         active.mission_id, verdict.tier.value)
+            return
+        if decision.action == WeatherAction.WARN:
+            log.warning("mission %s: WEATHER WARNING (%s) -- %s",
+                        active.mission_id, verdict.tier.value, reasons)
+            self._store.log_event(
+                active.mission_id, "weather_warning",
+                detail={"dry_run": True, "tier": verdict.tier.value,
+                        "reasons": list(decision.reasons),
+                        "grace_s": config.WEATHER_WARN_GRACE_S}, sync=True)
+            return
+        if decision.action == WeatherAction.STAY:
+            log.warning(
+                "mission %s: EMERGENCY -- weather %s but STAYING on station "
+                "(no countdown; only an explicit recall or SEVERE brings it "
+                "home): %s", active.mission_id, verdict.tier.value, reasons)
+            self._store.log_event(
+                active.mission_id, "weather_hold",
+                detail={"dry_run": True, "tier": verdict.tier.value,
+                        "reasons": list(decision.reasons),
+                        "note": "emergency mission holds through marginal weather"},
+                sync=True)
+            return
+        # RETURN
+        if decision.action == active.weather_last_action and prev == WeatherAction.RETURN:
+            return  # already returning
+        measured = self._weather.observed_conditions(self._snapshot())
+        log.error(
+            "mission %s: WEATHER RETURN%s -- %s (measured: wind %s m/s, "
+            "throttle %s%%)",
+            active.mission_id,
+            " (not overridable)" if verdict.tier == WeatherTier.SEVERE else "",
+            reasons, measured.wind_speed_ms, measured.throttle_pct,
+        )
+        self._store.log_event(
+            active.mission_id, "weather_return",
+            detail={
+                "dry_run": True, "tier": verdict.tier.value,
+                "reasons": list(decision.reasons),
+                "overridable": verdict.tier != WeatherTier.SEVERE and not active.weather_recalled,
+                "measured": {
+                    "wind_speed_ms": measured.wind_speed_ms,
+                    "throttle_pct": measured.throttle_pct,
+                    "vibration_max": measured.vibration_max,
+                },
+            },
+            sync=True,
+        )
+        self._store.create_alert(
+            mission_id=active.mission_id,
+            detail={
+                "kind": "weather_return",
+                "tier": verdict.tier.value,
+                "reasons": list(decision.reasons),
+                "returning_to": "dock",
+                "measured": {
+                    "wind_speed_ms": measured.wind_speed_ms,
+                    "throttle_pct": measured.throttle_pct,
+                },
+                "recording_until": "touchdown",
+            },
+        )
+        active.executor.abort(f"weather return ({verdict.tier.value}): {reasons}")
 
     # ---------------------------------------------------------- abort / hold
 
@@ -692,12 +1082,27 @@ class CommandIntake:
         while not self._stop.is_set():
             with self._active_lock:
                 active = self._active
+                awaiting = self._awaiting
             if active is not None:
                 try:
                     self._advance(active)
                 except Exception:
                     log.exception("mission supervisor: advancing %s failed", active.mission_id)
+            elif awaiting is not None:
+                try:
+                    self._service_awaiting(awaiting)
+                except Exception:
+                    log.exception("mission supervisor: awaiting %s failed", awaiting.mission_id)
             self._stop.wait(_SUPERVISOR_TICK_S)
+
+    def _service_awaiting(self, awaiting: _AwaitingConfirmation) -> None:
+        """A routine mission held for weather confirmation. No answer by the
+        deadline -> cancelled, not launched."""
+        if time.monotonic() >= awaiting.deadline_mono:
+            self._cancel_awaiting(
+                awaiting,
+                f"no operator decision within {config.WEATHER_CONFIRM_TIMEOUT_S:.0f}s",
+            )
 
     def _advance(self, active: _ActiveMission) -> None:
         phase = active.executor.poll()
@@ -705,6 +1110,13 @@ class CommandIntake:
         # safety.py is consulted every tick, independent of phase changes.
         if phase not in TERMINAL_PHASES:
             self._consult_safety(active)
+            # weather.py -- AFTER safety, and only while safety has NOT ordered
+            # anything: safety wins the authority order outright. If safety is
+            # holding (untrustworthy position) or driving home, weather does
+            # not get to countermand it -- e.g. "RETURN" is the wrong call when
+            # safety has said the position cannot be trusted.
+            if active.last_safety_action is None:
+                self._consult_weather(active)
 
         if phase not in TERMINAL_PHASES and not active.duration_abort_sent:
             if time.monotonic() - active.started_mono > self._mission_max_duration_s:
@@ -760,6 +1172,10 @@ class CommandIntake:
         )
         verdict = self._safety.current_verdict()
         if verdict.action not in _SAFETY_ACTIONABLE:
+            # Safety is nominal (ALLOW/WARN). Clear the marker so a later
+            # actionable verdict re-logs, and so weather.py may be consulted
+            # again (it is skipped while safety has ordered anything).
+            active.last_safety_action = None
             return
         if verdict.action == active.last_safety_action:
             return  # already acted on this verdict
@@ -779,7 +1195,47 @@ class CommandIntake:
             },
             sync=True,
         )
-        if verdict.action in (SafetyAction.RTL_NOW, SafetyAction.LAND_NOW):
+        if verdict.action == SafetyAction.DIVERT:
+            # Home is not reachable with the battery available. A real executor
+            # (v0.6) flies to the named safe spot and lands; the dry run ends
+            # here like an RTL. Say WHERE and WHY, loudly, with the numbers --
+            # if the drone lands away from its dock, whoever is looking for it
+            # needs that immediately.
+            tgt = verdict.divert_target or {}
+            self._store.log_event(
+                active.mission_id, "divert",
+                detail={
+                    "dry_run": True,
+                    "reasons": list(verdict.reasons),
+                    "safe_spot": {
+                        "name": tgt.get("spot_name"),
+                        "lat": tgt.get("spot_lat"),
+                        "lon": tgt.get("spot_lon"),
+                        "surface": tgt.get("spot_surface"),
+                        "has_marker": tgt.get("spot_has_marker"),
+                        "marker_id": tgt.get("spot_marker_id"),
+                        "height_above_dock_m": tgt.get("spot_height_above_dock_m"),
+                        "distance_m": tgt.get("spot_distance_m"),
+                    },
+                    "home_not_reachable": {
+                        "battery_pct": tgt.get("battery_pct"),
+                        "home_distance_m": tgt.get("home_distance_m"),
+                        "home_needed_pct": tgt.get("home_needed_pct"),
+                        "headwind_ms": tgt.get("headwind_ms"),
+                    },
+                },
+                sync=True,
+            )
+            self._write_divert_alert(active, verdict, diverting=True)
+            active.executor.abort(f"safety veto (DIVERT): {reasons}")
+        elif verdict.action in (SafetyAction.RTL_NOW, SafetyAction.LAND_NOW):
+            if verdict.action == SafetyAction.LAND_NOW and (
+                verdict.divert_target or {}
+            ).get("nowhere_reachable"):
+                # Landing where it is because nothing was reachable -- the
+                # worst case, and the one where the beacon (Phase 14) matters
+                # most. The alert must say so, with the last position.
+                self._write_divert_alert(active, verdict, diverting=False)
             active.executor.abort(f"safety veto ({verdict.action.value}): {reasons}")
         elif verdict.action == SafetyAction.HOLD:
             self._store.log_event(
@@ -812,8 +1268,62 @@ class CommandIntake:
             )
             active.executor.abort(f"unhandled safety action {verdict.action.value}: {reasons}")
 
+    def _write_divert_alert(
+        self, active: _ActiveMission, verdict, *, diverting: bool
+    ) -> None:
+        """A landing away from the dock. Whoever is looking for the drone needs
+        to know WHERE and WHY, immediately, with the numbers. If nothing was
+        reachable (``diverting`` False) the alert says that too, with the last
+        position -- and marks the beacon hook (spotlight + siren, Phase 14)."""
+        tgt = verdict.divert_target or {}
+        snap = self._snapshot()
+        detail: dict = {
+            "kind": "divert" if diverting else "land_now_nowhere",
+            "reasons": list(verdict.reasons),
+            "measured": {
+                "battery_pct": snap.battery_pct,
+                "wind_speed_ms": snap.wind_speed_ms,
+                "headwind_ms": tgt.get("headwind_ms"),
+                "home_distance_m": tgt.get("home_distance_m"),
+                "home_needed_pct": tgt.get("home_needed_pct"),
+            },
+            "no_drone_is_coming": not diverting,
+        }
+        if diverting:
+            detail["landing_at"] = {
+                "name": tgt.get("spot_name"),
+                "lat": tgt.get("spot_lat"),
+                "lon": tgt.get("spot_lon"),
+                "surface": tgt.get("spot_surface"),
+                "has_marker": tgt.get("spot_has_marker"),
+                "marker_id": tgt.get("spot_marker_id"),
+                "height_above_dock_m": tgt.get("spot_height_above_dock_m"),
+                "distance_m": tgt.get("spot_distance_m"),
+                "accuracy": "ArUco pad" if tgt.get("spot_has_marker") else "GPS-only",
+            }
+        else:
+            detail["landing_at"] = {
+                "name": "current position -- no safe spot reachable",
+                "lat": tgt.get("last_lat", snap.lat),
+                "lon": tgt.get("last_lon", snap.lon),
+            }
+            # BEACON HOOK: Phase 14's spotlight + siren payload activates here.
+            detail["beacon_hook"] = (
+                "spotlight + siren (Phase 14) should activate on this landing"
+            )
+        self._store.create_alert(mission_id=active.mission_id, detail=detail)
+        log.error(
+            "mission %s: %s -- alert written (%s)",
+            active.mission_id,
+            "DIVERT to a safe spot" if diverting
+            else "LAND_NOW where it is, nothing reachable",
+            detail["landing_at"],
+        )
+
     def _finalize(self, active: _ActiveMission, phase: MissionPhase) -> None:
         self._safety.set_context(None)
+        if self._weather is not None:
+            self._weather.end_mission()
         self._set_status(active.command_id, "done")
         with self._active_lock:
             if self._active is active:

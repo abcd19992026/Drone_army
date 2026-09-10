@@ -36,7 +36,7 @@ from gss.safety import (  # noqa: E402
     SafetyMonitor,
     SafetySeverity,
 )
-from gss.snapshot import TelemetrySnapshot  # noqa: E402
+from gss.snapshot import SafeSpot, TelemetrySnapshot  # noqa: E402
 
 _results: list[tuple[str, bool, str]] = []
 _NOW = datetime(2026, 9, 10, 12, 0, 0, tzinfo=timezone.utc)
@@ -128,6 +128,9 @@ class Scenario:
     link_down_s: float = 0.0
     gps_bad_s: float = 0.0
     discharge_rate: float | None = None
+    wind_ms: float = 0.0
+    wind_speed_ms: float | None = None
+    wind_from_deg: float | None = None
     prior_latch: SafetyAction | None = None
     reason_contains: str | None = None
     reason_contains_all: tuple[str, ...] = ()
@@ -241,8 +244,11 @@ _SCENARIOS: list[Scenario] = [
         reason_contains="link down",
     ),
     Scenario(
+        # ~6.7 km out: past the 6 km geofence, but still comfortably returnable
+        # on a healthy pack -- so the response is RTL_NOW (geofence), not the
+        # unreachable-home DIVERT/LAND path.
         "outside geofence radius",
-        snap(lat=config.HOME_LAT + 1.0, lon=config.HOME_LON + 1.0),
+        snap(lat=config.HOME_LAT + 0.06, lon=config.HOME_LON),
         _CRUISE_CTX,
         SafetyAction.RTL_NOW,
         SafetySeverity.CRITICAL,
@@ -286,6 +292,56 @@ _SCENARIOS: list[Scenario] = [
         expect_latched=True,
         prior_latch=SafetyAction.RTL_NOW,
         reason_contains="latched",
+    ),
+    Scenario(
+        # v0.5.1: return budget over the impossible threshold (a 9 m/s headwind
+        # onto a 954 m run at 24% left), and a reachable marker pad 66 m away.
+        "home unreachable (headwind), safe spot reachable -> DIVERT",
+        snap(battery_pct=24.0, alt_m_relative=25.0),
+        replace(
+            _CRUISE_CTX,
+            safe_spots=(
+                SafeSpot("north-field", _POS[0] + 0.0006, _POS[1], 15.0, "field",
+                         has_marker=True),
+            ),
+        ),
+        SafetyAction.DIVERT,
+        SafetySeverity.CRITICAL,
+        expect_latched=True,
+        discharge_rate=0.05,
+        wind_ms=9.0,
+        wind_speed_ms=9.0,
+        wind_from_deg=90.0,
+        reason_contains="north-field",
+    ),
+    Scenario(
+        # same case, but the safe-spot list is empty -> land where you are.
+        "home unreachable, nothing in range reachable -> LAND_NOW",
+        snap(battery_pct=24.0, alt_m_relative=25.0),
+        replace(_CRUISE_CTX, safe_spots=()),
+        SafetyAction.LAND_NOW,
+        SafetySeverity.EMERGENCY,
+        expect_latched=True,
+        discharge_rate=0.05,
+        wind_ms=9.0,
+        wind_speed_ms=9.0,
+        wind_from_deg=90.0,
+        reason_contains="no safe spot in range",
+    ),
+    Scenario(
+        # a moderate headwind that still leaves home reachable: RTL_NOW, not
+        # DIVERT. Proves the boundary works in both directions.
+        "moderate headwind, home still reachable -> RTL_NOW not DIVERT",
+        snap(battery_pct=26.0, alt_m_relative=20.0),
+        _CRUISE_CTX,
+        SafetyAction.RTL_NOW,
+        SafetySeverity.CRITICAL,
+        expect_latched=True,
+        discharge_rate=0.05,
+        wind_ms=3.0,
+        wind_speed_ms=3.0,
+        wind_from_deg=90.0,
+        reason_contains="point of no return",
     ),
     Scenario(
         "summon on-station too close to the human (R2), in flight",
@@ -349,6 +405,9 @@ def test_scenario_table() -> None:
             link_down_s=sc.link_down_s,
             gps_bad_s=sc.gps_bad_s,
             discharge_rate_pct_per_s=sc.discharge_rate,
+            wind_ms=sc.wind_ms,
+            wind_speed_ms=sc.wind_speed_ms,
+            wind_from_deg=sc.wind_from_deg,
             prior_latch=sc.prior_latch,
         )
         ok = (
@@ -446,6 +505,126 @@ def test_discharge_rate() -> None:
     rate = safety.observed_discharge_rate([(0.0, 90.0), (60.0, 84.0)], 60.0)
     _check("discharge rate: 6% over 60s -> 0.1 %/s",
            rate is not None and abs(rate - 0.1) < 1e-6, str(rate))
+
+
+# --------------------------------------------------------------------------
+# v0.5.1: the unreachable-home DIVERT
+# --------------------------------------------------------------------------
+
+
+def test_return_budget_clamps_a_spiked_rate() -> None:
+    """A transient huge observed discharge rate cannot on its own scream
+    'land in a field': the budget clamps the rate to a physical maximum."""
+    s = snap(battery_pct=40.0, alt_m_relative=25.0)
+    ctx = _CRUISE_CTX
+    spiked = safety.estimate_return_budget_pct(s, ctx, discharge_rate_pct_per_s=5.0)
+    clamped = safety.estimate_return_budget_pct(
+        s, ctx, discharge_rate_pct_per_s=safety._MAX_DISCHARGE_PCT_PER_S)
+    _check("return budget: a 5 %/s spike is clamped to the physical max",
+           abs(spiked - clamped) < 1e-6, f"spiked={spiked:.1f} clamped={clamped:.1f}")
+
+
+def test_safe_spot_selection_is_headwind_aware() -> None:
+    """Item 4: the SAME spot is reachable in calm air and NOT reachable into a
+    strong headwind -- selection uses the headwind-aware budget, not distance."""
+    s = snap(battery_pct=35.0, alt_m_relative=25.0, lat=25.60, lon=85.20,
+             position_valid=True)
+    # ~2 km due east
+    spot = SafeSpot("east-field", 25.60, 85.22, 20.0, "field")
+    ctx = SafetyContext(preflight=False, home_lat=config.HOME_LAT,
+                        home_lon=config.HOME_LON, safe_spots=(spot,))
+    calm = safety.select_divert_spot(
+        s, ctx, discharge_rate_pct_per_s=0.05, wind_speed_ms=0.0, wind_from_deg=0.0)
+    head = safety.select_divert_spot(
+        s, ctx, discharge_rate_pct_per_s=0.05, wind_speed_ms=9.0, wind_from_deg=90.0)
+    _check("safe spot: reachable in calm air", calm is not None and calm[0].name == "east-field")
+    _check("safe spot: the SAME spot is NOT reachable into a 9 m/s headwind",
+           head is None, "" if head is None else f"got {head[0].name}")
+
+
+def test_safe_spot_gps_only_needs_real_radius() -> None:
+    """A GPS-only spot whose row claims a small radius is REJECTED -- the number
+    is not trusted against 3-10 m of GPS error. The same spot with a marker
+    (accurate landing) is accepted."""
+    s = snap(battery_pct=60.0, alt_m_relative=25.0, lat=25.60, lon=85.20,
+             position_valid=True)
+    near = (25.601, 85.20)  # ~110 m away, easily reachable
+    gps_small = SafeSpot("alley", near[0], near[1], radius_m=8.0)          # < 20
+    gps_ok = SafeSpot("meadow", near[0], near[1], radius_m=25.0)           # >= 20
+    marker_small = SafeSpot("pad", near[0], near[1], radius_m=6.0, has_marker=True)
+    def pick(spot):
+        ctx = SafetyContext(preflight=False, home_lat=config.HOME_LAT,
+                            home_lon=config.HOME_LON, safe_spots=(spot,))
+        return safety.select_divert_spot(s, ctx, discharge_rate_pct_per_s=0.05)
+    _check("GPS-only spot below SAFE_SPOT_MIN_GPS_RADIUS_M -> rejected",
+           pick(gps_small) is None)
+    _check("GPS-only spot with a real clear radius -> accepted",
+           pick(gps_ok) is not None and pick(gps_ok)[0].name == "meadow")
+    _check("small pad WITH a marker -> accepted (vision lands it accurately)",
+           pick(marker_small) is not None and pick(marker_small)[0].name == "pad")
+
+
+def test_safe_spot_gps_only_rejects_raised_surface() -> None:
+    """A spot with a non-zero height above the dock and no marker is refused
+    outright: GPS cannot put an aircraft onto a raised surface it cannot see."""
+    s = snap(battery_pct=60.0, alt_m_relative=25.0, lat=25.60, lon=85.20,
+             position_valid=True)
+    near = (25.601, 85.20)
+    terrace_gps = SafeSpot("terrace-3F", near[0], near[1], radius_m=30.0,
+                           surface="terrace", height_above_dock_m=9.0)
+    terrace_marker = SafeSpot("terrace-3F", near[0], near[1], radius_m=6.0,
+                              surface="terrace", height_above_dock_m=9.0,
+                              has_marker=True)
+    def pick(spot):
+        ctx = SafetyContext(preflight=False, home_lat=config.HOME_LAT,
+                            home_lon=config.HOME_LON, safe_spots=(spot,))
+        return safety.select_divert_spot(s, ctx, discharge_rate_pct_per_s=0.05)
+    _check("raised surface, no marker -> rejected (would descend into a wall)",
+           pick(terrace_gps) is None)
+    _check("raised surface WITH a marker -> accepted",
+           pick(terrace_marker) is not None)
+
+
+def test_safe_spot_prefers_marker_pad() -> None:
+    """A marker pad is chosen over a closer GPS-only spot, up to
+    SAFE_SPOT_MARKER_PREFERENCE_M of extra distance -- and only up to that."""
+    s = snap(battery_pct=80.0, alt_m_relative=25.0, lat=25.60, lon=85.20,
+             position_valid=True)
+    gps_close = SafeSpot("field-200m", 25.6018, 85.20, radius_m=40.0)         # ~200 m
+    pad_mid = SafeSpot("pad-900m", 25.6081, 85.20, radius_m=6.0, has_marker=True)   # ~900 m
+    pad_far = SafeSpot("pad-1400m", 25.6126, 85.20, radius_m=6.0, has_marker=True)  # ~1400 m
+    def pick(*spots):
+        ctx = SafetyContext(preflight=False, home_lat=config.HOME_LAT,
+                            home_lon=config.HOME_LON, safe_spots=spots)
+        r = safety.select_divert_spot(s, ctx, discharge_rate_pct_per_s=0.05)
+        return r[0].name if r else None
+    _check("marker pad 900 m chosen over GPS-only spot 200 m (within 1 km preference)",
+           pick(gps_close, pad_mid) == "pad-900m")
+    _check("marker pad 1400 m NOT chosen over GPS-only spot 200 m (beyond 1 km)",
+           pick(gps_close, pad_far) == "field-200m")
+
+
+def test_safe_spot_book_fallback() -> None:
+    """Item 5: empty database and no cache -> the config fallback is used,
+    safety still returns a usable verdict, and nothing crashes."""
+    from gss.safe_spots import SafeSpotBook
+
+    book = SafeSpotBook(fetch=lambda: [], cache_path="/nonexistent/dir/nope.json",
+                        refresh_s=999)
+    spots = book.current()
+    _check("safe-spot book: empty DB + no cache -> config fallback (>=1 spot, the dock)",
+           len(spots) >= 1 and any(s.name == "dock" for s in spots), str(spots))
+    _check("safe-spot book: a refresh that returns nothing keeps the fallback, no crash",
+           book.refresh() is False and len(book.current()) >= 1)
+
+    ctx = replace(_CRUISE_CTX, safe_spots=spots)
+    v = safety.evaluate(
+        snap(battery_pct=24.0, alt_m_relative=25.0), ctx, now=_NOW,
+        discharge_rate_pct_per_s=0.05, wind_ms=9.0, wind_speed_ms=9.0,
+        wind_from_deg=90.0)
+    _check("safe-spot book: safety returns a usable verdict off the fallback list",
+           v.action in (SafetyAction.DIVERT, SafetyAction.LAND_NOW, SafetyAction.RTL_NOW),
+           v.action.value)
 
 
 # --------------------------------------------------------------------------
@@ -549,13 +728,16 @@ def test_monitor_latch_survives_flapping_battery() -> None:
 
 
 def test_import_boundary() -> None:
+    # safety.py imports weather.py (for the headwind helper), so weather.py is
+    # inside the same R1 boundary -- probe BOTH.
     probe = (
         "import sys\n"
-        "import gss.safety\n"
+        "import gss.safety, gss.weather\n"
         "roots = {'urllib','http','websockets','requests','socket','ssl','_socket',"
         "'_ssl','aiohttp','httpx','asyncio','ftplib','smtplib','poplib','imaplib',"
         "'telnetlib','xmlrpc','selectors','ssl'}\n"
-        "exact = {'gss.store','gss.commands','gss.executor','gss.link','gss.telemetry'}\n"
+        "exact = {'gss.store','gss.commands','gss.executor','gss.link',"
+        "'gss.telemetry','gss.weather_feed','gss.safe_spots'}\n"
         "bad = sorted(m for m in sys.modules if m in exact or m.split('.')[0] in roots)\n"
         "print(repr(bad))\n"
     )
@@ -566,8 +748,9 @@ def test_import_boundary() -> None:
     printed = (out.stdout or "").strip()
     _check("import boundary: probe ran", out.returncode == 0, out.stderr.strip()[:300])
     _check(
-        "import boundary: gss.safety pulls in NO networking module and none of "
-        "gss.store / gss.commands / gss.executor / gss.link / gss.telemetry (R1)",
+        "import boundary: gss.safety + gss.weather pull in NO networking module "
+        "and none of gss.store / gss.commands / gss.executor / gss.link / "
+        "gss.telemetry / gss.weather_feed (R1)",
         printed == "[]",
         f"leaked: {printed}",
     )
@@ -634,6 +817,11 @@ def _live_layer() -> int:
 
     import json
     import urllib.request
+
+    # These tests exercise safety.py in isolation. weather.py (v0.5) is a
+    # separate concern with its own suite (tests/test_weather.py) and must not
+    # reach the real internet here -- turn it off for this layer.
+    config.WEATHER_ENABLED = False
 
     from gss.commands import CommandIntake
     from gss.link import MavlinkLink
@@ -996,6 +1184,12 @@ def main() -> int:
         test_watchdog_verdict,
         test_latch_clear_rule,
         test_discharge_rate,
+        test_return_budget_clamps_a_spiked_rate,
+        test_safe_spot_selection_is_headwind_aware,
+        test_safe_spot_gps_only_needs_real_radius,
+        test_safe_spot_gps_only_rejects_raised_surface,
+        test_safe_spot_prefers_marker_pad,
+        test_safe_spot_book_fallback,
         test_monitor_gps_and_link_timers,
         test_monitor_self_watchdog,
         test_monitor_latch_survives_flapping_battery,

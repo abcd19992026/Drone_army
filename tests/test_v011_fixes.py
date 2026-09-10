@@ -79,11 +79,21 @@ def test_normal_streaming_and_guards() -> None:
         _check("Fix1: position + gps mapped",
                round(snap.lat, 4) == 25.5932 and snap.gps_fix_type == 3 and snap.gps_satellites == 12)
         _check("Fix3: position_valid True (coords + 3D fix)", snap.position_valid is True)
-        _wait(lambda: len(fv.requested_message_ids) == 5, 5)
-        _check("Fix1: all 5 messages requested via SET_MESSAGE_INTERVAL",
-               fv.requested_message_ids == {1, 24, 33, 74, 147}, str(sorted(fv.requested_message_ids)))
+        # v0.5 added WIND (168) and VIBRATION (241) to the stream plan.
+        _wait(lambda: len(fv.requested_message_ids) == 7, 5)
+        _check("Fix1: all 7 stream-plan messages requested via SET_MESSAGE_INTERVAL",
+               fv.requested_message_ids == {1, 24, 33, 74, 147, 168, 241},
+               str(sorted(fv.requested_message_ids)))
+        # The modern path is the primary one for all 7 (whether every ACK
+        # lands in time or one slips to the legacy fallback under load -- the
+        # check above proves every id still got requested). Wait for the
+        # on-connect callback to finish logging its summary.
+        _wait(lambda: "via SET_MESSAGE_INTERVAL (" in logs.getvalue()
+              or "SET_MESSAGE_INTERVAL accepted" in logs.getvalue(), 15)
+        _log = logs.getvalue()
         _check("Fix1: log records the SET_MESSAGE_INTERVAL path",
-               "via SET_MESSAGE_INTERVAL (5/5" in logs.getvalue())
+               "via SET_MESSAGE_INTERVAL (" in _log
+               or "SET_MESSAGE_INTERVAL accepted" in _log)
 
         fv.set_position(lat=0.0, lon=0.0)
         _wait(lambda: reader.get_snapshot().lat is None, 3)

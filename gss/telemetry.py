@@ -24,6 +24,7 @@ Design rules:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -44,18 +45,29 @@ _GPS_FIX_3D = mavutil.mavlink.GPS_FIX_TYPE_3D_FIX  # 3
 
 # (human name, MAVLink message id, requested rate in Hz). TelemetryReader owns
 # this list; link.py just transmits the requests.
+_MSG_WIND = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_WIND", 168)
+_MSG_VIBRATION = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_VIBRATION", 241)
+
 _STREAM_PLAN: tuple[tuple[str, int, float], ...] = (
     ("GLOBAL_POSITION_INT", mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, config.STREAM_RATE_POSITION_HZ),
     ("VFR_HUD", mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, config.STREAM_RATE_VFR_HZ),
     ("SYS_STATUS", mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, config.STREAM_RATE_STATUS_HZ),
     ("BATTERY_STATUS", mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS, config.STREAM_RATE_STATUS_HZ),
     ("GPS_RAW_INT", mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, config.STREAM_RATE_GPS_HZ),
+    # v0.5: the aircraft's own conditions sensing. WIND is ArduPilot's EKF wind
+    # estimate; VIBRATION carries accel vibration levels + clipping counts.
+    ("WIND", _MSG_WIND, config.STREAM_RATE_STATUS_HZ),
+    ("VIBRATION", _MSG_VIBRATION, config.STREAM_RATE_STATUS_HZ),
 )
 
-# Legacy fallback: (stream group, rate) covering the same messages.
+# Legacy fallback: (stream group, rate) covering the same messages. WIND and
+# VIBRATION both ride the EXTRA1/EXTRA3 groups on ArduPilot; EXTENDED_STATUS is
+# the safest single legacy bucket that ArduPilot maps them into.
 _STREAM_GROUPS_FALLBACK: tuple[tuple[int, float], ...] = (
     (mavutil.mavlink.MAV_DATA_STREAM_POSITION, config.STREAM_RATE_POSITION_HZ),
     (mavutil.mavlink.MAV_DATA_STREAM_EXTRA2, config.STREAM_RATE_VFR_HZ),
+    (mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, config.STREAM_RATE_STATUS_HZ),
+    (mavutil.mavlink.MAV_DATA_STREAM_EXTRA3, config.STREAM_RATE_STATUS_HZ),
     (
         mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS,
         max(config.STREAM_RATE_STATUS_HZ, config.STREAM_RATE_GPS_HZ),
@@ -91,6 +103,18 @@ class TelemetryReader:
         self._gps_satellites: int | None = None
         self._gps_hdop: float | None = None
 
+        # v0.5 observed conditions
+        self._wind_speed_ms: float | None = None
+        self._wind_direction_deg: float | None = None
+        self._throttle_pct: float | None = None
+        self._climb_rate_ms: float | None = None
+        self._vibration_x: float | None = None
+        self._vibration_y: float | None = None
+        self._vibration_z: float | None = None
+        self._vibration_clip_x: int | None = None
+        self._vibration_clip_y: int | None = None
+        self._vibration_clip_z: int | None = None
+
         # Per-field arrival times (UTC). A partial stream failure -- one message
         # stops while the rest keep coming -- is invisible in a single global
         # age, so safety.py checks each of these. ``None`` until first seen.
@@ -98,6 +122,8 @@ class TelemetryReader:
         self._battery_at: datetime | None = None
         self._attitude_at: datetime | None = None
         self._gps_at: datetime | None = None
+        self._wind_at: datetime | None = None
+        self._vibration_at: datetime | None = None
 
         # BATTERY_STATUS is richer than SYS_STATUS; once we have seen it, stop
         # letting SYS_STATUS overwrite the battery fields.
@@ -118,7 +144,10 @@ class TelemetryReader:
         """
         accepted = 0
         for name, message_id, rate_hz in _STREAM_PLAN:
-            if link.request_message_interval(message_id, rate_hz):
+            # 2s per ACK: the requests are serialised (one MAV_CMD id, one ACK
+            # at a time) and the vehicle is already streaming by the time the
+            # later ones go out, so 1s was tight under load.
+            if link.request_message_interval(message_id, rate_hz, ack_timeout_s=2.0):
                 accepted += 1
             else:
                 log.debug("%s not ACKed via SET_MESSAGE_INTERVAL", name)
@@ -171,6 +200,9 @@ class TelemetryReader:
             with self._lock:
                 self._attitude_at = now
                 self._groundspeed_ms = float(message.groundspeed)
+                # throttle 0-100; climb + up. 0 is legitimate for both.
+                self._throttle_pct = float(message.throttle)
+                self._climb_rate_ms = float(message.climb)
 
         elif message_type == "HEARTBEAT":
             # Ignore heartbeats from non-autopilot components (e.g. a GCS).
@@ -212,6 +244,38 @@ class TelemetryReader:
                 )
                 eph = getattr(message, "eph", _UINT16_MAX)
                 self._gps_hdop = None if eph in (0, _UINT16_MAX) else eph / 100.0
+
+        elif message_type == "WIND":
+            # Legacy ArduPilot WIND: direction the wind blows FROM (deg),
+            # horizontal speed (m/s). speed < 0 means "no estimate".
+            speed = float(message.speed)
+            with self._lock:
+                self._wind_at = now
+                if speed < 0:
+                    self._wind_speed_ms = None
+                    self._wind_direction_deg = None
+                else:
+                    self._wind_speed_ms = speed
+                    self._wind_direction_deg = float(message.direction) % 360.0
+
+        elif message_type == "WIND_COV":
+            wx, wy = float(message.wind_x), float(message.wind_y)
+            with self._lock:
+                self._wind_at = now
+                self._wind_speed_ms = math.hypot(wx, wy)
+                # wind_x/y is the vector the wind travels along (NED); the
+                # "from" bearing is the opposite direction.
+                self._wind_direction_deg = math.degrees(math.atan2(-wy, -wx)) % 360.0
+
+        elif message_type == "VIBRATION":
+            with self._lock:
+                self._vibration_at = now
+                self._vibration_x = float(message.vibration_x)
+                self._vibration_y = float(message.vibration_y)
+                self._vibration_z = float(message.vibration_z)
+                self._vibration_clip_x = int(message.clipping_0)
+                self._vibration_clip_y = int(message.clipping_1)
+                self._vibration_clip_z = int(message.clipping_2)
 
     def get_snapshot(self) -> TelemetrySnapshot:
         """Return the current immutable :class:`TelemetrySnapshot`."""
@@ -271,6 +335,18 @@ class TelemetryReader:
                 attitude_age_s=_age(self._attitude_at),
                 gps_age_s=_age(self._gps_at),
                 gps_hdop=self._gps_hdop,
+                wind_speed_ms=self._wind_speed_ms,
+                wind_direction_deg=self._wind_direction_deg,
+                throttle_pct=self._throttle_pct,
+                climb_rate_ms=self._climb_rate_ms,
+                vibration_x=self._vibration_x,
+                vibration_y=self._vibration_y,
+                vibration_z=self._vibration_z,
+                vibration_clip_x=self._vibration_clip_x,
+                vibration_clip_y=self._vibration_clip_y,
+                vibration_clip_z=self._vibration_clip_z,
+                wind_age_s=_age(self._wind_at),
+                vibration_age_s=_age(self._vibration_at),
             )
 
 

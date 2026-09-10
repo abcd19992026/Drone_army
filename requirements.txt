@@ -4,3 +4,5 @@ pymavlink==2.4.42       # MAVLink
 python-dotenv==1.0.1    # .env loading
 websockets==13.1        # Supabase Realtime (sync client); v0.3 command intake fast path
 # Supabase REST/RPC calls use the standard library (urllib) -- no client lib.
+# The Open-Meteo weather fetch (v0.5, gss/weather_feed.py) also uses urllib --
+# still no new dependency.
