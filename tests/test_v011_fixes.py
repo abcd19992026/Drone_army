@@ -16,8 +16,12 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import sys
 import time
+
+# These tests exercise the MAVLink path only; keep the Supabase side out of it.
+os.environ.setdefault("SUPABASE_ENABLED", "false")
 
 from gss import config
 from gss.link import MavlinkLink

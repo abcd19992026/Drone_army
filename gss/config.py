@@ -55,6 +55,37 @@ def _get_int(name: str, default: int) -> int:
         raise ValueError(f"config: {name} must be an integer, got {raw!r}") from exc
 
 
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    """Return env var ``name`` parsed as a boolean, or ``default`` if unset/blank."""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE:
+        return True
+    if value in _FALSE:
+        return False
+    raise ValueError(
+        f"config: {name} must be one of {sorted(_TRUE | _FALSE)}, got {raw!r}"
+    )
+
+
+def _looks_like_uuid(value: str) -> bool:
+    """True if ``value`` is a canonical 8-4-4-4-12 hex UUID string."""
+    parts = value.split("-")
+    if len(parts) != 5 or [len(p) for p in parts] != [8, 4, 4, 4, 12]:
+        return False
+    try:
+        int(value.replace("-", ""), 16)
+    except ValueError:
+        return False
+    return True
+
+
 # --- Link -------------------------------------------------------------------
 MAVLINK_CONNECTION: str = _get_str("MAVLINK_CONNECTION", "tcp:127.0.0.1:5762")
 
@@ -102,6 +133,19 @@ STREAM_RATE_GPS_HZ: float = _get_float("STREAM_RATE_GPS_HZ", 1.0)           # GP
 # for this long, re-send the stream requests (rate-limited).
 STREAM_WATCHDOG_S: float = _get_float("STREAM_WATCHDOG_S", 5.0)
 STREAM_REREQUEST_MIN_S: float = _get_float("STREAM_REREQUEST_MIN_S", 2.0)
+
+# --- Supabase sync (v0.2) --------------------------------------------------
+# The network side is strictly downstream and best-effort (rule R10). None of
+# these values are read on the MAVLink path; safety-critical numbers stay in
+# this file, never in the database (rule R1).
+SUPABASE_ENABLED: bool = _get_bool("SUPABASE_ENABLED", True)
+SUPABASE_URL: str = _get_str("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY: str = _get_str("SUPABASE_SERVICE_ROLE_KEY", "")
+DRONE_ID: str = _get_str("DRONE_ID", "d5030000-0000-4000-8000-000000000001")
+DOCK_ID: str = _get_str("DOCK_ID", "d0c00000-0000-4000-8000-000000000001")
+SUPABASE_TELEMETRY_INTERVAL_S: float = _get_float("SUPABASE_TELEMETRY_INTERVAL_S", 2.0)
+SUPABASE_HEARTBEAT_WRITE_S: float = _get_float("SUPABASE_HEARTBEAT_WRITE_S", 15.0)
+SUPABASE_QUEUE_MAX: int = _get_int("SUPABASE_QUEUE_MAX", 200)
 
 # --- Logging ---------------------------------------------------------------
 LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
@@ -194,6 +238,39 @@ def _validate() -> None:
 
     if not MAVLINK_CONNECTION:
         errors.append("MAVLINK_CONNECTION must not be empty")
+
+    # --- Supabase ---
+    if SUPABASE_TELEMETRY_INTERVAL_S <= 0:
+        errors.append(
+            f"SUPABASE_TELEMETRY_INTERVAL_S must be positive, got {SUPABASE_TELEMETRY_INTERVAL_S}"
+        )
+    if SUPABASE_HEARTBEAT_WRITE_S < SUPABASE_TELEMETRY_INTERVAL_S:
+        errors.append(
+            f"SUPABASE_HEARTBEAT_WRITE_S ({SUPABASE_HEARTBEAT_WRITE_S}) must be >= "
+            f"SUPABASE_TELEMETRY_INTERVAL_S ({SUPABASE_TELEMETRY_INTERVAL_S})"
+        )
+    if SUPABASE_QUEUE_MAX < 1:
+        errors.append(f"SUPABASE_QUEUE_MAX must be >= 1, got {SUPABASE_QUEUE_MAX}")
+
+    for name, value in (("DRONE_ID", DRONE_ID), ("DOCK_ID", DOCK_ID)):
+        if value and not _looks_like_uuid(value):
+            errors.append(f"{name} must be a UUID, got {value!r}")
+
+    if SUPABASE_ENABLED:
+        # No silent no-persistence mode: refuse to start without credentials.
+        if not SUPABASE_URL:
+            errors.append(
+                "SUPABASE_URL is required when SUPABASE_ENABLED is true "
+                "(set SUPABASE_ENABLED=false to run with no persistence)"
+            )
+        elif not (SUPABASE_URL.startswith("http://") or SUPABASE_URL.startswith("https://")):
+            errors.append(f"SUPABASE_URL must be an http(s) URL, got {SUPABASE_URL!r}")
+        if not SUPABASE_SERVICE_ROLE_KEY:
+            errors.append(
+                "SUPABASE_SERVICE_ROLE_KEY is required when SUPABASE_ENABLED is true"
+            )
+        if not DRONE_ID:
+            errors.append("DRONE_ID is required when SUPABASE_ENABLED is true")
 
     if errors:
         raise ValueError(

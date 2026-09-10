@@ -1,4 +1,4 @@
-"""GSS v0.1 entry point: connect to the vehicle and print telemetry.
+"""GSS entry point: connect to the vehicle, print telemetry, mirror it upstream.
 
 Run with::
 
@@ -8,6 +8,11 @@ Connects to the MAVLink endpoint from :mod:`gss.config`, then prints one
 telemetry line every ``TELEMETRY_INTERVAL_S`` seconds. If the link is down it
 keeps printing a "link down" line and the background thread keeps retrying --
 the process does not exit. Ctrl+C shuts down cleanly.
+
+When ``SUPABASE_ENABLED`` is true it also starts :class:`~gss.store.TelemetryStore`,
+which mirrors telemetry into the database on its own threads. That path is
+strictly best-effort (rule R10): if it is slow, failing, or disabled, the
+console output above is byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -39,9 +44,13 @@ def run() -> int:
 
     link = MavlinkLink()
     reader = TelemetryReader(link)
+    store = _make_store(reader)
     shutdown = threading.Event()
 
     try:
+        if store is not None:
+            store.start()
+
         # Give the link a short grace period so the first console line is
         # usually populated, but never block the telemetry loop on it -- the
         # background thread reconnects forever regardless.
@@ -56,10 +65,31 @@ def run() -> int:
     except KeyboardInterrupt:
         log.info("Ctrl+C received, shutting down.")
     finally:
+        if store is not None:
+            log.info("Flushing Supabase queue...")
+            store.close(timeout_s=5.0)
         log.info("Closing link...")
         link.close()
         log.info("GSS stopped.")
     return 0
+
+
+def _make_store(reader: TelemetryReader):
+    """Build the telemetry store, or return None when persistence is disabled.
+
+    A construction failure is logged and downgraded to None -- the GSS must
+    still fly the drone and print to the console (rule R10).
+    """
+    if not config.SUPABASE_ENABLED:
+        log.info("Supabase sync disabled (SUPABASE_ENABLED=false); console only.")
+        return None
+    try:
+        from gss.store import TelemetryStore
+
+        return TelemetryStore(reader.get_snapshot)
+    except Exception:
+        log.exception("Could not initialise Supabase sync; continuing without it")
+        return None
 
 
 if __name__ == "__main__":

@@ -51,3 +51,10 @@ media/
 *~
 Thumbs.db
 .DS_Store
+
+# Web status page -- real config holds the project URL + anon key
+web/config.js
+
+# Supabase CLI local state
+supabase/.branches/
+supabase/.temp/
