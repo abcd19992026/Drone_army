@@ -1,0 +1,313 @@
+"""Read MAVLink messages into a single latest-known telemetry snapshot.
+
+``TelemetryReader`` subscribes to :class:`~gss.link.MavlinkLink` and keeps the
+most recent value seen for each field.
+
+It owns two things:
+  * the mapping from MAVLink messages to snapshot fields, and
+  * the decision of WHICH messages to ask the vehicle for, at WHAT rate --
+    sent through :class:`MavlinkLink` on every (re)connection.
+
+Design rules:
+  * A field that has not been received yet is ``None``, never ``0``. A missing
+    value and a real zero are different things and a later safety module must
+    tell them apart.
+  * ``lat``/``lon`` of exactly 0/0 is ArduPilot's "no position estimate", not
+    a real fix -- stored as ``None``.
+  * ``position_valid`` is True only with real coordinates AND a 3D GPS fix.
+    v0.4+ gates navigation decisions on this flag.
+  * Battery *voltage* is captured alongside percentage on purpose -- percentage
+    on a Li-ion pack reads optimistically under load, so voltage will serve as
+    an independent floor.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from pymavlink import mavutil
+
+from gss import config
+from gss.link import MavlinkLink
+
+log = logging.getLogger(__name__)
+
+_UINT16_MAX = 65535
+_UINT8_MAX = 255
+_GPS_FIX_3D = mavutil.mavlink.GPS_FIX_TYPE_3D_FIX  # 3
+
+# (human name, MAVLink message id, requested rate in Hz). TelemetryReader owns
+# this list; link.py just transmits the requests.
+_STREAM_PLAN: tuple[tuple[str, int, float], ...] = (
+    ("GLOBAL_POSITION_INT", mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, config.STREAM_RATE_POSITION_HZ),
+    ("VFR_HUD", mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD, config.STREAM_RATE_VFR_HZ),
+    ("SYS_STATUS", mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, config.STREAM_RATE_STATUS_HZ),
+    ("BATTERY_STATUS", mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS, config.STREAM_RATE_STATUS_HZ),
+    ("GPS_RAW_INT", mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT, config.STREAM_RATE_GPS_HZ),
+)
+
+# Legacy fallback: (stream group, rate) covering the same messages.
+_STREAM_GROUPS_FALLBACK: tuple[tuple[int, float], ...] = (
+    (mavutil.mavlink.MAV_DATA_STREAM_POSITION, config.STREAM_RATE_POSITION_HZ),
+    (mavutil.mavlink.MAV_DATA_STREAM_EXTRA2, config.STREAM_RATE_VFR_HZ),
+    (
+        mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS,
+        max(config.STREAM_RATE_STATUS_HZ, config.STREAM_RATE_GPS_HZ),
+    ),
+)
+
+
+@dataclass(frozen=True)
+class TelemetrySnapshot:
+    """Immutable point-in-time view of the drone's state.
+
+    Every optional field is ``None`` until the corresponding MAVLink message
+    has been received at least once.
+    """
+
+    timestamp: datetime
+    connected: bool
+    lat: float | None
+    lon: float | None
+    position_valid: bool
+    alt_m_amsl: float | None
+    alt_m_relative: float | None
+    heading_deg: float | None
+    groundspeed_ms: float | None
+    mode: str | None
+    armed: bool | None
+    battery_pct: float | None
+    battery_voltage_v: float | None
+    battery_current_a: float | None
+    gps_fix_type: int | None
+    gps_satellites: int | None
+    link_age_s: float | None
+
+
+class TelemetryReader:
+    """Consumes messages from a :class:`MavlinkLink` and holds the latest values."""
+
+    def __init__(self, link: MavlinkLink) -> None:
+        """Register with ``link``; the reader starts collecting immediately."""
+        self._link = link
+        self._lock = threading.Lock()
+
+        self._lat: float | None = None
+        self._lon: float | None = None
+        self._alt_m_amsl: float | None = None
+        self._alt_m_relative: float | None = None
+        self._heading_deg: float | None = None
+        self._groundspeed_ms: float | None = None
+        self._mode: str | None = None
+        self._armed: bool | None = None
+        self._battery_pct: float | None = None
+        self._battery_voltage_v: float | None = None
+        self._battery_current_a: float | None = None
+        self._gps_fix_type: int | None = None
+        self._gps_satellites: int | None = None
+
+        # BATTERY_STATUS is richer than SYS_STATUS; once we have seen it, stop
+        # letting SYS_STATUS overwrite the battery fields.
+        self._battery_status_seen = False
+
+        link.register_message_callback(self._on_message)
+        link.register_on_connect(self._request_streams)
+
+    # --- stream requests (decides what to ask for; link.py transmits) ------
+
+    def _request_streams(self, link: MavlinkLink) -> None:
+        """on-connect callback: ask the vehicle to stream the messages we map.
+
+        Runs on link's connect-worker thread, never the RX thread, so it may
+        block briefly waiting for command ACKs. Tries
+        MAV_CMD_SET_MESSAGE_INTERVAL first; if the vehicle does not accept
+        every request, also sends the legacy REQUEST_DATA_STREAM groups.
+        """
+        accepted = 0
+        for name, message_id, rate_hz in _STREAM_PLAN:
+            if link.request_message_interval(message_id, rate_hz):
+                accepted += 1
+            else:
+                log.debug("%s not ACKed via SET_MESSAGE_INTERVAL", name)
+
+        if accepted == len(_STREAM_PLAN):
+            log.info(
+                "Telemetry streams requested via SET_MESSAGE_INTERVAL (%d/%d messages)",
+                accepted, len(_STREAM_PLAN),
+            )
+            return
+
+        log.warning(
+            "SET_MESSAGE_INTERVAL accepted %d/%d requests; "
+            "falling back to REQUEST_DATA_STREAM",
+            accepted, len(_STREAM_PLAN),
+        )
+        for stream_id, rate_hz in _STREAM_GROUPS_FALLBACK:
+            link.request_data_stream(stream_id, rate_hz)
+        log.info(
+            "Telemetry streams requested via REQUEST_DATA_STREAM (%d groups)",
+            len(_STREAM_GROUPS_FALLBACK),
+        )
+
+    # --- message mapping --------------------------------------------------
+
+    def _on_message(self, message: Any) -> None:
+        """Map one MAVLink message onto the stored fields. Runs on the RX thread."""
+        message_type = message.get_type()
+
+        if message_type == "GLOBAL_POSITION_INT":
+            raw_lat, raw_lon = message.lat, message.lon
+            with self._lock:
+                if raw_lat == 0 and raw_lon == 0:
+                    # ArduPilot sends 0/0 when it has no position estimate.
+                    self._lat = None
+                    self._lon = None
+                else:
+                    self._lat = raw_lat / 1e7
+                    self._lon = raw_lon / 1e7
+                # 0 is a legitimate altitude/heading -- do not zero-guard these.
+                self._alt_m_amsl = message.alt / 1000.0
+                self._alt_m_relative = message.relative_alt / 1000.0
+                self._heading_deg = (
+                    message.hdg / 100.0 if message.hdg != _UINT16_MAX else None
+                )
+
+        elif message_type == "VFR_HUD":
+            with self._lock:
+                self._groundspeed_ms = float(message.groundspeed)
+
+        elif message_type == "HEARTBEAT":
+            # Ignore heartbeats from non-autopilot components (e.g. a GCS).
+            if message.autopilot == mavutil.mavlink.MAV_AUTOPILOT_INVALID:
+                return
+            mode = mavutil.mode_string_v10(message)
+            armed = bool(
+                message.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+            )
+            with self._lock:
+                self._mode = mode
+                self._armed = armed
+
+        elif message_type == "SYS_STATUS":
+            with self._lock:
+                if not self._battery_status_seen:
+                    self._battery_voltage_v = _voltage_mv_to_v(message.voltage_battery)
+                    self._battery_current_a = _current_ca_to_a(message.current_battery)
+                    self._battery_pct = _percent(message.battery_remaining)
+
+        elif message_type == "BATTERY_STATUS":
+            first_cell = message.voltages[0] if message.voltages else _UINT16_MAX
+            with self._lock:
+                self._battery_status_seen = True
+                self._battery_voltage_v = _voltage_mv_to_v(first_cell)
+                self._battery_current_a = _current_ca_to_a(message.current_battery)
+                self._battery_pct = _percent(message.battery_remaining)
+
+        elif message_type == "GPS_RAW_INT":
+            with self._lock:
+                self._gps_fix_type = int(message.fix_type)
+                self._gps_satellites = (
+                    int(message.satellites_visible)
+                    if message.satellites_visible != _UINT8_MAX
+                    else None
+                )
+
+    def get_snapshot(self) -> TelemetrySnapshot:
+        """Return the current immutable :class:`TelemetrySnapshot`."""
+        now = datetime.now(timezone.utc)
+        last_heartbeat = self._link.last_heartbeat_at
+        link_age_s = (
+            (now - last_heartbeat).total_seconds()
+            if last_heartbeat is not None
+            else None
+        )
+        with self._lock:
+            fix = self._gps_fix_type
+            position_valid = (
+                self._lat is not None
+                and self._lon is not None
+                and fix is not None
+                and fix >= _GPS_FIX_3D
+            )
+            return TelemetrySnapshot(
+                timestamp=now,
+                connected=self._link.is_connected,
+                lat=self._lat,
+                lon=self._lon,
+                position_valid=position_valid,
+                alt_m_amsl=self._alt_m_amsl,
+                alt_m_relative=self._alt_m_relative,
+                heading_deg=self._heading_deg,
+                groundspeed_ms=self._groundspeed_ms,
+                mode=self._mode,
+                armed=self._armed,
+                battery_pct=self._battery_pct,
+                battery_voltage_v=self._battery_voltage_v,
+                battery_current_a=self._battery_current_a,
+                gps_fix_type=fix,
+                gps_satellites=self._gps_satellites,
+                link_age_s=link_age_s,
+            )
+
+
+def _voltage_mv_to_v(millivolts: int) -> float | None:
+    """Convert a MAVLink millivolt reading to volts; 0 / UINT16_MAX mean unknown."""
+    if millivolts in (0, _UINT16_MAX):
+        return None
+    return millivolts / 1000.0
+
+
+def _current_ca_to_a(centiamps: int) -> float | None:
+    """Convert a MAVLink centiamp reading to amps; -1 means unknown."""
+    if centiamps == -1:
+        return None
+    return centiamps / 100.0
+
+
+def _percent(value: int) -> float | None:
+    """Return a battery-remaining percentage; -1 means unknown."""
+    if value == -1:
+        return None
+    return float(value)
+
+
+def _fmt(value: float | int | None, spec: str, na: str = "--") -> str:
+    """Format ``value`` with ``spec``, or return ``na`` right-padded to width."""
+    if value is None:
+        width = 0
+        for ch in spec:
+            if ch.isdigit():
+                width = width * 10 + int(ch)
+            elif ch == ".":
+                break
+        return na.rjust(width) if width else na
+    return format(value, spec)
+
+
+def format_console_line(snapshot: TelemetrySnapshot) -> str:
+    """Render a snapshot as one readable console line."""
+    stamp = snapshot.timestamp.astimezone().strftime("%H:%M:%S")
+
+    if not snapshot.connected:
+        age = _fmt(snapshot.link_age_s, ".0f", na="?")
+        return f"[{stamp}] LINK DOWN, reconnecting (last heartbeat {age}s ago)"
+
+    armed = "----" if snapshot.armed is None else ("ARMED" if snapshot.armed else "disarm")
+    pos_label = "POS " if snapshot.position_valid else "pos?"
+    return (
+        f"[{stamp}] "
+        f"{(snapshot.mode or '----'):>9} {armed:>6} "
+        f"alt {_fmt(snapshot.alt_m_relative, '6.1f')}m rel "
+        f"spd {_fmt(snapshot.groundspeed_ms, '5.1f')}m/s "
+        f"hdg {_fmt(snapshot.heading_deg, '5.1f')} "
+        f"{pos_label}{_fmt(snapshot.lat, '10.6f')},{_fmt(snapshot.lon, '10.6f')} "
+        f"bat {_fmt(snapshot.battery_pct, '3.0f')}% "
+        f"{_fmt(snapshot.battery_voltage_v, '5.2f')}V "
+        f"{_fmt(snapshot.battery_current_a, '5.1f')}A "
+        f"gps fix{_fmt(snapshot.gps_fix_type, '1d')}/{_fmt(snapshot.gps_satellites, '2d')}sat "
+        f"link {_fmt(snapshot.link_age_s, '4.1f')}s"
+    )
