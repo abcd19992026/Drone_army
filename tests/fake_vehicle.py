@@ -92,6 +92,11 @@ class FakeVehicle:
         self._requested_ids: set[int] = set()
         self._stream_all = False
         self._heartbeat_only = False
+        # Individually silenced message ids: HEARTBEAT and every other stream
+        # keep flowing, these do not. Reproduces one MAVLink message type going
+        # silent on an otherwise healthy link -- common on a real radio, and the
+        # case where the system looks fine and is not.
+        self._suppressed_ids: set[int] = set()
 
         # --- driveable vehicle state ---
         self._lat_deg = 0.0
@@ -198,6 +203,22 @@ class FakeVehicle:
         with self._lock:
             self._heartbeat_only = bool(value)
 
+    def suppress_message(self, message_id: int) -> None:
+        """Stop streaming just this MAVLink message id. HEARTBEAT and every
+        other requested stream keep flowing normally."""
+        with self._lock:
+            self._suppressed_ids.add(int(message_id))
+
+    def resume_message(self, message_id: int) -> None:
+        """Undo :meth:`suppress_message` for this id."""
+        with self._lock:
+            self._suppressed_ids.discard(int(message_id))
+
+    @property
+    def suppressed_message_ids(self) -> set[int]:
+        with self._lock:
+            return set(self._suppressed_ids)
+
     def disconnect_clean(self) -> None:
         """Force a normal TCP close (FIN) of the current client connection."""
         with self._lock:
@@ -225,6 +246,8 @@ class FakeVehicle:
     def _wants(self, message_id: int) -> bool:
         with self._lock:
             if self._heartbeat_only:
+                return False
+            if message_id in self._suppressed_ids:
                 return False
             return self._stream_all or message_id in self._requested_ids
 

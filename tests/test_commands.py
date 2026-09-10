@@ -113,7 +113,11 @@ class _Rig:
     def __init__(self, *, connected=True, fix_type=3, realtime_enabled=True, port=5799):
         self._port = port
         self.fv = FakeVehicle(port=port)
-        self.fv.set_position(lat=25.90, lon=85.90, fix_type=fix_type, satellites=11)
+        # Park the vehicle ~700 m from home (25.5932, 85.2045): inside the 6 km
+        # geofence so the v0.4 safety monitor's continuous position check stays
+        # nominal. (v0.3 never checked the vehicle's own position, so its exact
+        # value here was arbitrary.)
+        self.fv.set_position(lat=25.5975, lon=85.2085, fix_type=fix_type, satellites=11)
         self.fv.set_battery(pct=73, voltage_v=23.4)
         self.fv.start()
         self.fv.wait_for_client(2)

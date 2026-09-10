@@ -51,10 +51,21 @@ from gss.executor import (
     MissionPhase,
     make_executor,
 )
+from gss.safety import SafetyAction, SafetyContext, SafetyMonitor
 from gss.store import TelemetryStore
 from gss.telemetry import TelemetrySnapshot
 
 log = logging.getLogger(__name__)
+
+# In-flight verdicts the supervisor drives the executor on.
+_SAFETY_ACTIONABLE = frozenset(
+    {
+        SafetyAction.HOLD,
+        SafetyAction.DESCEND,
+        SafetyAction.RTL_NOW,
+        SafetyAction.LAND_NOW,
+    }
+)
 
 # The commands.type CHECK set (keep in sync with the schema migration).
 _KNOWN_COMMAND_TYPES = frozenset({
@@ -139,6 +150,7 @@ class _ActiveMission:
     started_mono: float
     last_phase: MissionPhase = MissionPhase.QUEUED
     duration_abort_sent: bool = False
+    last_safety_action: SafetyAction | None = None
 
 
 class _RealtimeSubscriber:
@@ -271,6 +283,7 @@ class CommandIntake:
         supabase_key: str | None = None,
         executor_factory=make_executor,
         realtime_enabled: bool = True,
+        safety: SafetyMonitor | None = None,
     ) -> None:
         self._store = store
         self._snapshot = snapshot_source
@@ -304,6 +317,17 @@ class CommandIntake:
         self._executor_factory = executor_factory
         self._realtime_enabled = realtime_enabled
 
+        # safety.py has the final say on every flight command and drives the
+        # executor in flight. If the caller does not supply a monitor we own
+        # one -- the veto is not optional (R1/R12). Intake never runs without it.
+        self._owns_safety = safety is None
+        self._safety = safety or SafetyMonitor(
+            snapshot_source,
+            event_sink=(store.log_event if store is not None else None),
+            home_lat=self._home_lat,
+            home_lon=self._home_lon,
+        )
+
         self._stop = threading.Event()
         self._inbox: queue.Queue[str] = queue.Queue()
         self._seen = _RecentIds(_RECENT_IDS_CAP)
@@ -324,6 +348,8 @@ class CommandIntake:
     # ------------------------------------------------------------------ API
 
     def start(self) -> None:
+        if self._owns_safety:
+            self._safety.start()
         self._threads = [
             threading.Thread(target=self._handler_loop, name="cmd-handler", daemon=True),
             threading.Thread(target=self._poll_loop, name="cmd-poller", daemon=True),
@@ -375,6 +401,9 @@ class CommandIntake:
                 "command intake: %d status write(s) never persisted: %s",
                 len(leftover), leftover,
             )
+        self._safety.set_context(None)
+        if self._owns_safety:
+            self._safety.close(timeout_s=max(0.1, deadline - time.monotonic()))
         log.info("command intake stopped")
 
     @property
@@ -520,6 +549,16 @@ class CommandIntake:
                 f"a {active.command.get('type')} mission is already running "
                 f"(mission {active.mission_id}); a second one is rejected, not queued"
             )
+
+        # 9. safety.py has the FINAL say. Everything above is intake sanity --
+        # a first filter, NOT a substitute for the safety system. safety.py
+        # re-checks geofence / battery / position / lateral offset here and
+        # again, continuously, in flight. Nobody may delete this call or
+        # safety.py's checks on the grounds that commands.py already validated.
+        # (server_now is the DB clock -- this path never reads the local clock.)
+        verdict = self._safety.evaluate_command(cmd, now=server_now, mission_active=False)
+        if verdict.action == SafetyAction.REJECT:
+            return "safety veto -- " + "; ".join(verdict.reasons)
         return None
 
     # ---------------------------------------------------------- accept
@@ -576,10 +615,30 @@ class CommandIntake:
                 executor=executor,
                 started_mono=time.monotonic(),
             )
+        self._safety.set_context(self._safety_context(cmd, mission_id, MissionPhase.QUEUED))
         executor.start()
         log.info(
             "command %s ACCEPTED -> mission %s (%s). DRY RUN begins.",
             command_id, mission_id, mission_type,
+        )
+
+    def _safety_context(
+        self, cmd: dict, mission_id: str, phase: MissionPhase
+    ) -> SafetyContext:
+        """The in-flight context safety.py evaluates this mission against."""
+        params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
+        return SafetyContext(
+            preflight=False,
+            phase=phase.value,
+            mission_id=mission_id,
+            is_summon=(cmd.get("type") == "summon"),
+            target_lat=cmd.get("target_lat"),
+            target_lon=cmd.get("target_lon"),
+            target_alt_m=cmd.get("target_alt_m"),
+            home_lat=self._home_lat,
+            home_lon=self._home_lon,
+            human_lat=params.get("human_lat"),
+            human_lon=params.get("human_lon"),
         )
 
     # ---------------------------------------------------------- abort / hold
@@ -643,6 +702,10 @@ class CommandIntake:
     def _advance(self, active: _ActiveMission) -> None:
         phase = active.executor.poll()
 
+        # safety.py is consulted every tick, independent of phase changes.
+        if phase not in TERMINAL_PHASES:
+            self._consult_safety(active)
+
         if phase not in TERMINAL_PHASES and not active.duration_abort_sent:
             if time.monotonic() - active.started_mono > self._mission_max_duration_s:
                 active.duration_abort_sent = True
@@ -683,7 +746,74 @@ class CommandIntake:
         if phase in TERMINAL_PHASES:
             self._finalize(active, phase)
 
+    def _consult_safety(self, active: _ActiveMission) -> None:
+        """Every supervisor tick: ask safety.py, and drive the executor on its
+        verdict. RTL_NOW / LAND_NOW -> abort the dry run; HOLD / DESCEND ->
+        record what a real executor (v0.6) would do. A 'safety_veto'
+        mission_event carries the full reason list.
+
+        Every actionable verdict is handled EXPLICITLY -- an unrecognised
+        action is a loud error that aborts (fail safe), never a silent
+        fall-through."""
+        self._safety.set_context(
+            self._safety_context(active.command, active.mission_id, active.last_phase)
+        )
+        verdict = self._safety.current_verdict()
+        if verdict.action not in _SAFETY_ACTIONABLE:
+            return
+        if verdict.action == active.last_safety_action:
+            return  # already acted on this verdict
+        active.last_safety_action = verdict.action
+        reasons = "; ".join(verdict.reasons) or verdict.severity.value
+        log.error(
+            "mission %s: SAFETY VETO %s (%s) -- %s",
+            active.mission_id, verdict.action.value, verdict.severity.value, reasons,
+        )
+        self._store.log_event(
+            active.mission_id, "safety_veto",
+            detail={
+                "action": verdict.action.value,
+                "severity": verdict.severity.value,
+                "latched": verdict.latched,
+                "reasons": list(verdict.reasons),
+            },
+            sync=True,
+        )
+        if verdict.action in (SafetyAction.RTL_NOW, SafetyAction.LAND_NOW):
+            active.executor.abort(f"safety veto ({verdict.action.value}): {reasons}")
+        elif verdict.action == SafetyAction.HOLD:
+            self._store.log_event(
+                active.mission_id, "loiter_start",
+                detail={"dry_run": True, "note": "safety HOLD", "reasons": list(verdict.reasons)},
+                sync=True,
+            )
+        elif verdict.action == SafetyAction.DESCEND:
+            # v0.4 is dry-run: log what v0.6's real executor will do. The
+            # mission is not aborted -- DESCEND means correct the altitude and
+            # keep going.
+            log.warning(
+                "[DRY RUN] mission %s: would stop horizontal progress and "
+                "descend to a safe altitude -- %s", active.mission_id, reasons,
+            )
+            self._store.log_event(
+                active.mission_id, "loiter_start",
+                detail={"dry_run": True, "note": "safety DESCEND",
+                        "would": "stop and descend below MAX_ALT_M",
+                        "reasons": list(verdict.reasons)},
+                sync=True,
+            )
+        else:
+            # A new SafetyAction was added to _SAFETY_ACTIONABLE without a
+            # branch here. Do not guess -- fail safe and make it visible.
+            log.error(
+                "mission %s: unhandled safety action %r -- aborting the dry run "
+                "(a branch is missing in _consult_safety)",
+                active.mission_id, verdict.action,
+            )
+            active.executor.abort(f"unhandled safety action {verdict.action.value}: {reasons}")
+
     def _finalize(self, active: _ActiveMission, phase: MissionPhase) -> None:
+        self._safety.set_context(None)
         self._set_status(active.command_id, "done")
         with self._active_lock:
             if self._active is active:

@@ -163,6 +163,33 @@ MISSION_MAX_DURATION_S: float = _get_float("MISSION_MAX_DURATION_S", 900.0)
 # factory's assertion and the check below. Do not set it true.
 ALLOW_VEHICLE_CONTROL: bool = _get_bool("ALLOW_VEHICLE_CONTROL", False)
 
+# --- safety.py (v0.4) ----------------------------------------------------------
+# These live HERE and NOT in the database's system_config table, on purpose:
+# safety.py must reach a correct verdict with no network and no Supabase
+# (rule R1). A value safety depends on cannot sit behind an HTTP call that
+# fails exactly when the drone is airborne and the broadband is down.
+#
+# Every number below is a STARTING POINT to be tuned against real flight data,
+# not a measured truth. They are deliberately conservative: erring toward an
+# early return costs a cut-short mission; erring the other way costs the
+# aircraft. Do not tighten them without flight logs to justify it.
+SAFETY_TICK_HZ: float = _get_float("SAFETY_TICK_HZ", 4.0)
+SAFETY_WATCHDOG_S: float = _get_float("SAFETY_WATCHDOG_S", 3.0)
+POSITION_MAX_AGE_S: float = _get_float("POSITION_MAX_AGE_S", 2.0)
+BATTERY_MAX_AGE_S: float = _get_float("BATTERY_MAX_AGE_S", 5.0)
+GPS_MAX_AGE_S: float = _get_float("GPS_MAX_AGE_S", 5.0)
+BATTERY_CELLS: int = _get_int("BATTERY_CELLS", 6)
+BATTERY_CELL_FLOOR_V: float = _get_float("BATTERY_CELL_FLOOR_V", 3.2)
+BATTERY_LAUNCH_MIN_PCT: float = _get_float("BATTERY_LAUNCH_MIN_PCT", 50.0)
+RTL_RESERVE_PCT: float = _get_float("RTL_RESERVE_PCT", 20.0)
+CRUISE_SPEED_MS: float = _get_float("CRUISE_SPEED_MS", 10.0)
+MIN_ALT_M: float = _get_float("MIN_ALT_M", 5.0)
+GPS_MIN_SATELLITES: int = _get_int("GPS_MIN_SATELLITES", 8)
+GPS_MAX_HDOP: float = _get_float("GPS_MAX_HDOP", 2.0)
+GPS_LOSS_GRACE_S: float = _get_float("GPS_LOSS_GRACE_S", 15.0)
+LINK_LOSS_GRACE_S: float = _get_float("LINK_LOSS_GRACE_S", 30.0)
+DISCHARGE_WINDOW_S: float = _get_float("DISCHARGE_WINDOW_S", 60.0)
+
 # --- Logging ---------------------------------------------------------------
 LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
 
@@ -297,6 +324,59 @@ def _validate() -> None:
     ):
         if value <= 0:
             errors.append(f"{name} must be positive, got {value}")
+
+    # --- safety.py (v0.4) ---
+    for name, value in (
+        ("SAFETY_TICK_HZ", SAFETY_TICK_HZ),
+        ("SAFETY_WATCHDOG_S", SAFETY_WATCHDOG_S),
+        ("POSITION_MAX_AGE_S", POSITION_MAX_AGE_S),
+        ("BATTERY_MAX_AGE_S", BATTERY_MAX_AGE_S),
+        ("GPS_MAX_AGE_S", GPS_MAX_AGE_S),
+        ("BATTERY_CELL_FLOOR_V", BATTERY_CELL_FLOOR_V),
+        ("CRUISE_SPEED_MS", CRUISE_SPEED_MS),
+        ("MIN_ALT_M", MIN_ALT_M),
+        ("GPS_MAX_HDOP", GPS_MAX_HDOP),
+        ("GPS_LOSS_GRACE_S", GPS_LOSS_GRACE_S),
+        ("LINK_LOSS_GRACE_S", LINK_LOSS_GRACE_S),
+        ("DISCHARGE_WINDOW_S", DISCHARGE_WINDOW_S),
+    ):
+        if value <= 0:
+            errors.append(f"{name} must be positive, got {value}")
+
+    if SAFETY_TICK_HZ > 50:
+        errors.append(f"SAFETY_TICK_HZ unreasonably high (>50 Hz), got {SAFETY_TICK_HZ}")
+    if SAFETY_WATCHDOG_S <= 1.0 / SAFETY_TICK_HZ:
+        errors.append(
+            f"SAFETY_WATCHDOG_S ({SAFETY_WATCHDOG_S}) must exceed one tick period "
+            f"({1.0 / SAFETY_TICK_HZ:.3f}s at {SAFETY_TICK_HZ} Hz)"
+        )
+    if BATTERY_CELLS < 1:
+        errors.append(f"BATTERY_CELLS must be >= 1, got {BATTERY_CELLS}")
+    if not 2.5 <= BATTERY_CELL_FLOOR_V <= 4.2:
+        errors.append(
+            f"BATTERY_CELL_FLOOR_V ({BATTERY_CELL_FLOOR_V}) is outside a sane "
+            f"Li-ion range [2.5, 4.2]"
+        )
+    for name, value in (
+        ("BATTERY_LAUNCH_MIN_PCT", BATTERY_LAUNCH_MIN_PCT),
+        ("RTL_RESERVE_PCT", RTL_RESERVE_PCT),
+    ):
+        if not 0.0 <= value <= 100.0:
+            errors.append(f"{name} out of range [0, 100]: {value}")
+    if BATTERY_LAUNCH_MIN_PCT <= BATTERY_FLOOR_PCT:
+        errors.append(
+            f"BATTERY_LAUNCH_MIN_PCT ({BATTERY_LAUNCH_MIN_PCT}) must be above "
+            f"BATTERY_FLOOR_PCT ({BATTERY_FLOOR_PCT}): passing through a level "
+            f"in flight is not the same as launching at it"
+        )
+    if GPS_MIN_SATELLITES < 4:
+        errors.append(
+            f"GPS_MIN_SATELLITES must be >= 4 (a 3D fix needs 4), got {GPS_MIN_SATELLITES}"
+        )
+    if MIN_ALT_M >= MAX_ALT_M:
+        errors.append(
+            f"MIN_ALT_M ({MIN_ALT_M}) must be below MAX_ALT_M ({MAX_ALT_M})"
+        )
 
     if ALLOW_VEHICLE_CONTROL:
         # Hard stop. There is no vehicle-control executor before v0.5, and no

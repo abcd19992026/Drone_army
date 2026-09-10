@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +32,9 @@ from pymavlink import mavutil
 
 from gss import config
 from gss.link import MavlinkLink
+from gss.snapshot import TelemetrySnapshot
+
+__all__ = ["TelemetryReader", "TelemetrySnapshot", "format_console_line"]
 
 log = logging.getLogger(__name__)
 
@@ -61,32 +63,9 @@ _STREAM_GROUPS_FALLBACK: tuple[tuple[int, float], ...] = (
 )
 
 
-@dataclass(frozen=True)
-class TelemetrySnapshot:
-    """Immutable point-in-time view of the drone's state.
-
-    Every optional field is ``None`` until the corresponding MAVLink message
-    has been received at least once.
-    """
-
-    timestamp: datetime
-    connected: bool
-    lat: float | None
-    lon: float | None
-    position_valid: bool
-    alt_m_amsl: float | None
-    alt_m_relative: float | None
-    heading_deg: float | None
-    groundspeed_ms: float | None
-    mode: str | None
-    armed: bool | None
-    battery_pct: float | None
-    battery_voltage_v: float | None
-    battery_current_a: float | None
-    gps_fix_type: int | None
-    gps_satellites: int | None
-    link_age_s: float | None       # seconds since the last HEARTBEAT
-    telemetry_age_s: float | None  # seconds since the last real telemetry message
+# TelemetrySnapshot now lives in gss/snapshot.py (imported above and re-exported)
+# so safety.py can depend on the type without importing a socket. See that
+# module's docstring.
 
 
 class TelemetryReader:
@@ -110,6 +89,15 @@ class TelemetryReader:
         self._battery_current_a: float | None = None
         self._gps_fix_type: int | None = None
         self._gps_satellites: int | None = None
+        self._gps_hdop: float | None = None
+
+        # Per-field arrival times (UTC). A partial stream failure -- one message
+        # stops while the rest keep coming -- is invisible in a single global
+        # age, so safety.py checks each of these. ``None`` until first seen.
+        self._position_at: datetime | None = None
+        self._battery_at: datetime | None = None
+        self._attitude_at: datetime | None = None
+        self._gps_at: datetime | None = None
 
         # BATTERY_STATUS is richer than SYS_STATUS; once we have seen it, stop
         # letting SYS_STATUS overwrite the battery fields.
@@ -159,10 +147,12 @@ class TelemetryReader:
     def _on_message(self, message: Any) -> None:
         """Map one MAVLink message onto the stored fields. Runs on the RX thread."""
         message_type = message.get_type()
+        now = datetime.now(timezone.utc)
 
         if message_type == "GLOBAL_POSITION_INT":
             raw_lat, raw_lon = message.lat, message.lon
             with self._lock:
+                self._position_at = now
                 if raw_lat == 0 and raw_lon == 0:
                     # ArduPilot sends 0/0 when it has no position estimate.
                     self._lat = None
@@ -179,6 +169,7 @@ class TelemetryReader:
 
         elif message_type == "VFR_HUD":
             with self._lock:
+                self._attitude_at = now
                 self._groundspeed_ms = float(message.groundspeed)
 
         elif message_type == "HEARTBEAT":
@@ -196,6 +187,7 @@ class TelemetryReader:
         elif message_type == "SYS_STATUS":
             with self._lock:
                 if not self._battery_status_seen:
+                    self._battery_at = now
                     self._battery_voltage_v = _voltage_mv_to_v(message.voltage_battery)
                     self._battery_current_a = _current_ca_to_a(message.current_battery)
                     self._battery_pct = _percent(message.battery_remaining)
@@ -204,18 +196,22 @@ class TelemetryReader:
             first_cell = message.voltages[0] if message.voltages else _UINT16_MAX
             with self._lock:
                 self._battery_status_seen = True
+                self._battery_at = now
                 self._battery_voltage_v = _voltage_mv_to_v(first_cell)
                 self._battery_current_a = _current_ca_to_a(message.current_battery)
                 self._battery_pct = _percent(message.battery_remaining)
 
         elif message_type == "GPS_RAW_INT":
             with self._lock:
+                self._gps_at = now
                 self._gps_fix_type = int(message.fix_type)
                 self._gps_satellites = (
                     int(message.satellites_visible)
                     if message.satellites_visible != _UINT8_MAX
                     else None
                 )
+                eph = getattr(message, "eph", _UINT16_MAX)
+                self._gps_hdop = None if eph in (0, _UINT16_MAX) else eph / 100.0
 
     def get_snapshot(self) -> TelemetrySnapshot:
         """Return the current immutable :class:`TelemetrySnapshot`."""
@@ -230,13 +226,26 @@ class TelemetryReader:
         telemetry_age_s = (
             (now - last_data).total_seconds() if last_data is not None else None
         )
+        def _age(stamp: datetime | None) -> float | None:
+            return (now - stamp).total_seconds() if stamp is not None else None
+
         with self._lock:
             fix = self._gps_fix_type
+            sats = self._gps_satellites
+            position_age_s = _age(self._position_at)
+            # position_valid (v0.4): real coords AND a 3D fix AND enough
+            # satellites AND a report that is not stale. A 30-second-old
+            # position with position_valid still True is exactly the failure
+            # safety.py must never see.
             position_valid = (
                 self._lat is not None
                 and self._lon is not None
                 and fix is not None
                 and fix >= _GPS_FIX_3D
+                and sats is not None
+                and sats >= config.GPS_MIN_SATELLITES
+                and position_age_s is not None
+                and position_age_s <= config.POSITION_MAX_AGE_S
             )
             return TelemetrySnapshot(
                 timestamp=now,
@@ -254,9 +263,14 @@ class TelemetryReader:
                 battery_voltage_v=self._battery_voltage_v,
                 battery_current_a=self._battery_current_a,
                 gps_fix_type=fix,
-                gps_satellites=self._gps_satellites,
+                gps_satellites=sats,
                 link_age_s=link_age_s,
                 telemetry_age_s=telemetry_age_s,
+                position_age_s=position_age_s,
+                battery_age_s=_age(self._battery_at),
+                attitude_age_s=_age(self._attitude_at),
+                gps_age_s=_age(self._gps_at),
+                gps_hdop=self._gps_hdop,
             )
 
 

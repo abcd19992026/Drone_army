@@ -47,10 +47,25 @@ def run() -> int:
     link = MavlinkLink()
     reader = TelemetryReader(link)
     store = _make_store(reader)
-    intake = _make_intake(store, reader)
+    safety = None
+    intake = None
     shutdown = threading.Event()
 
     try:
+        # Safety is a HARD start-up requirement -- see _make_safety. If it
+        # cannot be built or started, the GSS does not run.
+        safety = _make_safety(reader, store)
+        try:
+            safety.start()
+        except Exception:
+            log.critical(
+                "Safety monitor failed to start; the GSS will not run without it "
+                "(R12 -- fail safe, never fail open).",
+                exc_info=True,
+            )
+            return 3
+
+        intake = _make_intake(store, reader, safety)
         if store is not None:
             store.start()
         if intake is not None:
@@ -73,6 +88,9 @@ def run() -> int:
         if intake is not None:
             log.info("Stopping command intake...")
             intake.close(timeout_s=5.0)
+        if safety is not None:
+            log.info("Stopping safety monitor...")
+            safety.close(timeout_s=3.0)
         if store is not None:
             log.info("Flushing Supabase queue...")
             store.close(timeout_s=5.0)
@@ -80,6 +98,35 @@ def run() -> int:
         link.close()
         log.info("GSS stopped.")
     return 0
+
+
+def _make_safety(reader: TelemetryReader, store):
+    """Build the safety monitor. It runs regardless of Supabase (rule R1): a
+    ``None`` store just means no best-effort event mirror, local logs stand.
+
+    This is a HARD start-up requirement. If the monitor cannot be constructed,
+    the GSS logs the reason and EXITS non-zero -- it does not run without a
+    veto authority (R12: fail safe, never fail open).
+
+    This is deliberately NOT gated on ALLOW_VEHICLE_CONTROL or dry-run mode.
+    The danger is not that a dry run flies -- it is that "we will make this
+    strict later" notes get lost, and the day someone wires MavlinkExecutor
+    in, this door must already be shut.
+    """
+    try:
+        from gss.safety import SafetyMonitor
+
+        return SafetyMonitor(
+            reader.get_snapshot,
+            event_sink=(store.log_event if store is not None else None),
+        )
+    except Exception:
+        log.critical(
+            "Safety monitor could not be constructed; the GSS will not run "
+            "without it (R12 -- fail safe, never fail open).",
+            exc_info=True,
+        )
+        raise SystemExit(3)
 
 
 def _make_store(reader: TelemetryReader):
@@ -100,7 +147,7 @@ def _make_store(reader: TelemetryReader):
         return None
 
 
-def _make_intake(store, reader: TelemetryReader):
+def _make_intake(store, reader: TelemetryReader, safety):
     """Build the command intake, or None. Requires the store (Supabase).
 
     A construction failure is logged and downgraded to None -- the GSS still
@@ -115,7 +162,7 @@ def _make_intake(store, reader: TelemetryReader):
     try:
         from gss.commands import CommandIntake
 
-        return CommandIntake(store, reader.get_snapshot)
+        return CommandIntake(store, reader.get_snapshot, safety=safety)
     except Exception:
         log.exception("Could not initialise command intake; continuing without it")
         return None

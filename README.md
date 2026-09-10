@@ -6,13 +6,31 @@ production; for now it runs on Windows against ArduPilot SITL.
 
 **Scope so far:** MAVLink link with forever-reconnect and telemetry to the
 console; a best-effort Supabase mirror of the telemetry plus a live status
-page (v0.2); command intake -> **dry-run** missions (v0.3). The GSS transmits
-nothing over MAVLink but telemetry stream-rate requests (send boundary at the
-top of `gss/link.py`, rule **R11**); network calls live in `gss/store.py` and
-`gss/commands.py` and never block the flight path (rule **R10**). It does not
-arm, change mode, take off, or send a waypoint -- v0.3 walks accepted missions
-through their states on a timer and logs what a real flight *would* do.
-`safety.py` (v0.4) and a real executor (v0.5) come next. See `PROJECT.md`.
+page (v0.2); command intake -> **dry-run** missions (v0.3); `safety.py`, the
+veto authority (v0.4). The GSS transmits nothing over MAVLink but telemetry
+stream-rate requests (send boundary at the top of `gss/link.py`, rule **R11**);
+network calls live in `gss/store.py` and `gss/commands.py` and never block the
+flight path (rule **R10**). It does not arm, change mode, take off, or send a
+waypoint -- v0.3 walks accepted missions through their states on a timer and
+logs what a real flight *would* do, and v0.4 can veto and interrupt them. A
+real executor (v0.5) comes next. See `PROJECT.md`.
+
+**safety.py (v0.4):** a pure decision core (state in, verdict out -- no I/O, no
+clock reads) wrapped in a thin loop thread (`SafetyMonitor`) at
+`SAFETY_TICK_HZ`, with a watchdog on itself. It answers two questions: may this
+command start a flight (pre-flight `REJECT`/`ALLOW`), and given the state right
+now must the drone do something else
+(`WARN`/`HOLD`/`DESCEND`/`RTL_NOW`/`LAND_NOW`). It is the final authority -- no
+override, no bypass. It **fails safe** (any check it cannot evaluate -> DENY,
+rule **R12**), its critical verdicts **latch** until the drone is on the ground
+and disarmed (rule **R13**), and it imports **no** network and **no** database
+code, directly or transitively (rule **R1**; `tests/test_safety.py` asserts the
+boundary). It is a **hard start-up requirement**: if the monitor cannot be
+built or started, the GSS logs why and exits non-zero -- it never runs without a
+veto authority. `gss/commands.py` calls its pre-flight gate before accepting any
+flight command, and the mission supervisor consults it every tick and drives the
+`DryRunExecutor` on its verdict (every action handled explicitly; an
+unrecognised one aborts, never falls through).
 
 ## Layout
 
@@ -21,10 +39,12 @@ gss/
   config.py       all settings + import-time validation (only place with a connection string)
   link.py         MavlinkLink: connect, receive on a daemon thread, reconnect,
                   on-connect callbacks, stream watchdog, stream-rate requests
-  telemetry.py    TelemetrySnapshot + TelemetryReader: latest-known state
+  snapshot.py     TelemetrySnapshot -- the immutable state type, no imports beyond stdlib
+  telemetry.py    TelemetryReader: latest-known state, per-field staleness (re-exports the snapshot)
   store.py        TelemetryStore: Supabase telemetry mirror + command/mission DB ops
   commands.py     CommandIntake: Realtime + poller -> claim -> validate -> dry-run mission
   executor.py     Executor interface + DryRunExecutor (v0.3) + make_executor()
+  safety.py       the veto authority (v0.4): pure decision core + SafetyMonitor loop
   main.py         entry point: wire it together, print a line every 2s
 supabase/
   migrations/     the schema -- the source of truth (apply with the Supabase CLI)
@@ -36,6 +56,7 @@ tests/
   test_v011_fixes.py  MAVLink-path regressions (18)
   test_store.py       store.py vs a local mock HTTP endpoint (24)
   test_commands.py    v0.3 command intake vs the real Supabase project in .env (37)
+  test_safety.py      v0.4 safety: pure scenario table + shell + import boundary + live layer
 ```
 
 ## Setup (Windows)
