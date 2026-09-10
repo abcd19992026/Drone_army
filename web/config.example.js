@@ -8,4 +8,8 @@ window.GSS_CONFIG = {
   SUPABASE_ANON_KEY: "YOUR-ANON-OR-PUBLISHABLE-KEY",
   // The drone row to watch. Matches DRONE_ID in gss/config.py / .env.
   DRONE_ID: "d5030000-0000-4000-8000-000000000001",
+  // Home / dock, for the "Summon 20 km away" reject-test button. Keep in sync
+  // with HOME_LAT / HOME_LON in gss/config.py.
+  HOME_LAT: 25.5932,
+  HOME_LON: 85.2045,
 };

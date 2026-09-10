@@ -147,6 +147,22 @@ SUPABASE_TELEMETRY_INTERVAL_S: float = _get_float("SUPABASE_TELEMETRY_INTERVAL_S
 SUPABASE_HEARTBEAT_WRITE_S: float = _get_float("SUPABASE_HEARTBEAT_WRITE_S", 15.0)
 SUPABASE_QUEUE_MAX: int = _get_int("SUPABASE_QUEUE_MAX", 200)
 
+# --- Command intake (v0.3) ------------------------------------------------
+# The path from a commands row to a decision. Realtime is the fast path, the
+# poller is the correct one -- both run. This module never transmits a MAVLink
+# message (rule R11); it hands accepted missions to an executor.
+COMMAND_POLL_INTERVAL_S: float = _get_float("COMMAND_POLL_INTERVAL_S", 3.0)
+COMMAND_DEFAULT_TTL_S: float = _get_float("COMMAND_DEFAULT_TTL_S", 120.0)
+# A flight command is only accepted while telemetry is this fresh -- accepting
+# one while blind is not acceptable. (Intake sanity only; safety.py re-checks.)
+TELEMETRY_MAX_AGE_S: float = _get_float("TELEMETRY_MAX_AGE_S", 10.0)
+MISSION_MAX_DURATION_S: float = _get_float("MISSION_MAX_DURATION_S", 900.0)
+
+# Guard rail: MUST stay false until safety.py (v0.4) exists and a real
+# executor (v0.5) sits behind it. Nothing reads this except the executor
+# factory's assertion and the check below. Do not set it true.
+ALLOW_VEHICLE_CONTROL: bool = _get_bool("ALLOW_VEHICLE_CONTROL", False)
+
 # --- Logging ---------------------------------------------------------------
 LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
 
@@ -271,6 +287,25 @@ def _validate() -> None:
             )
         if not DRONE_ID:
             errors.append("DRONE_ID is required when SUPABASE_ENABLED is true")
+
+    # --- Command intake (v0.3) ---
+    for name, value in (
+        ("COMMAND_POLL_INTERVAL_S", COMMAND_POLL_INTERVAL_S),
+        ("COMMAND_DEFAULT_TTL_S", COMMAND_DEFAULT_TTL_S),
+        ("TELEMETRY_MAX_AGE_S", TELEMETRY_MAX_AGE_S),
+        ("MISSION_MAX_DURATION_S", MISSION_MAX_DURATION_S),
+    ):
+        if value <= 0:
+            errors.append(f"{name} must be positive, got {value}")
+
+    if ALLOW_VEHICLE_CONTROL:
+        # Hard stop. There is no vehicle-control executor before v0.5, and no
+        # safety.py before v0.4. A future version relaxes this line; until
+        # then the GSS must not start with this flag set.
+        errors.append(
+            "ALLOW_VEHICLE_CONTROL must be false: safety.py (v0.4) and a real "
+            "executor (v0.5) do not exist yet. The GSS is dry-run only."
+        )
 
     if errors:
         raise ValueError(

@@ -118,6 +118,34 @@
       <div class="muted" id="fLastKnownAt" style="margin-top:2px">&mdash;</div>
       <div class="muted" style="margin-top:8px">Kept from the last valid GPS fix. Not cleared when the link drops.</div>
     </div>
+
+    <div class="card">
+      <div class="k" style="font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;margin-bottom:10px">
+        Commands
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">
+        <button id="cmdSummon">Summon (here)</button>
+        <button id="cmdHold" class="ghost">Hold</button>
+        <button id="cmdAbort" class="ghost">Abort</button>
+        <button id="cmdBad" class="ghost" title="Deliberately invalid, to see rejection working">Summon 20 km away</button>
+      </div>
+      <div class="muted" id="cmdMsg" style="margin-top:8px;min-height:16px"></div>
+      <div class="muted" style="margin-top:2px">Inserts a row into <code>commands</code> &mdash; the only write this page can do.</div>
+
+      <div style="margin-top:16px;overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:13px" id="cmdTable">
+          <thead>
+            <tr style="text-align:left;color:var(--dim)">
+              <th style="padding:4px 8px 4px 0">Type</th>
+              <th style="padding:4px 8px">Status</th>
+              <th style="padding:4px 8px">Reason / detail</th>
+              <th style="padding:4px 8px">Issued</th>
+            </tr>
+          </thead>
+          <tbody id="cmdRows"><tr><td colspan="4" class="muted" style="padding:6px 0">&mdash;</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -238,13 +266,80 @@
       render(res.data);
     }
     if (channel) sb.removeChannel(channel);
-    channel = sb.channel("drone-" + DRONE_ID)
+    channel = sb.channel("gss-page-" + DRONE_ID)
       .on("postgres_changes",
         { event: "*", schema: "public", table: "drones", filter: "id=eq." + DRONE_ID },
         function (payload) { render(payload.new); })
+      .on("postgres_changes",
+        { event: "*", schema: "public", table: "commands", filter: "drone_id=eq." + DRONE_ID },
+        function () { loadCommands(); })
       .subscribe();
     if (staleTimer) clearInterval(staleTimer);
     staleTimer = setInterval(refreshStale, 1000);
+    loadCommands();
+  }
+
+  // ---- commands -----------------------------------------------------
+  var HOME = { lat: (cfg.HOME_LAT != null ? cfg.HOME_LAT : 25.5932),
+               lon: (cfg.HOME_LON != null ? cfg.HOME_LON : 85.2045) };
+
+  async function issue(type, extra) {
+    $("cmdMsg").textContent = "sending " + type + "…";
+    var row = Object.assign({ drone_id: DRONE_ID, type: type }, extra || {});
+    var s = await sb.auth.getUser();
+    if (s.data && s.data.user) row.issued_by = s.data.user.email;
+    var r = await sb.from("commands").insert(row);
+    $("cmdMsg").textContent = r.error
+      ? "insert failed: " + r.error.message
+      : type + " sent — watch the table below for the GSS's decision";
+  }
+
+  function withGeo(cb) {
+    if (!navigator.geolocation) { $("cmdMsg").textContent = "no geolocation in this browser"; return; }
+    $("cmdMsg").textContent = "getting your location…";
+    navigator.geolocation.getCurrentPosition(
+      function (p) { cb(p.coords.latitude, p.coords.longitude); },
+      function (e) { $("cmdMsg").textContent = "location denied: " + e.message; },
+      { enableHighAccuracy: true, timeout: 10000 });
+  }
+
+  function bindCmd(id, fn) { $(id).addEventListener("click", fn); }
+  bindCmd("cmdSummon", function () {
+    withGeo(function (lat, lon) { issue("summon", { target_lat: lat, target_lon: lon }); });
+  });
+  bindCmd("cmdHold", function () { issue("hold"); });
+  bindCmd("cmdAbort", function () { issue("abort"); });
+  bindCmd("cmdBad", function () {
+    // ~20 km north of home -> outside MAX_RADIUS_M, so the GSS must reject it
+    issue("summon", { target_lat: HOME.lat + 0.18, target_lon: HOME.lon });
+  });
+
+  async function loadCommands() {
+    var r = await sb.from("commands")
+      .select("type,status,rejected_reason,issued_at,issued_by")
+      .eq("drone_id", DRONE_ID).order("issued_at", { ascending: false }).limit(10);
+    var body = $("cmdRows");
+    if (r.error || !r.data || !r.data.length) {
+      body.innerHTML = '<tr><td colspan="4" class="muted" style="padding:6px 0">' +
+        (r.error ? r.error.message : "no commands yet") + "</td></tr>";
+      return;
+    }
+    var statusCls = { done: "ok", accepted: "ok", executing: "ok",
+                      rejected: "bad", expired: "warn", pending: "warn" };
+    body.innerHTML = r.data.map(function (c) {
+      var cls = statusCls[c.status] || "";
+      return "<tr>" +
+        '<td style="padding:5px 8px 5px 0">' + esc(c.type) + "</td>" +
+        '<td style="padding:5px 8px"><span class="pill ' + cls + '">' + esc(c.status) + "</span></td>" +
+        '<td style="padding:5px 8px">' + esc(c.rejected_reason || "") + "</td>" +
+        '<td style="padding:5px 8px" class="muted">' + fmtTime(c.issued_at) + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (ch) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[ch];
+    });
   }
 
   // ---- auth --------------------------------------------------------

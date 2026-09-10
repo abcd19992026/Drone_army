@@ -1,4 +1,6 @@
-# GSS v0.1 runtime dependencies. Pinned deliberately -- the dock Pi runs this
+# GSS runtime dependencies. Pinned deliberately -- the dock Pi runs this
 # 24/7 and must not pick up surprise upgrades.
-pymavlink==2.4.42
-python-dotenv==1.0.1
+pymavlink==2.4.42       # MAVLink
+python-dotenv==1.0.1    # .env loading
+websockets==13.1        # Supabase Realtime (sync client); v0.3 command intake fast path
+# Supabase REST/RPC calls use the standard library (urllib) -- no client lib.

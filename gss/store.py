@@ -53,7 +53,8 @@ from gss.telemetry import TelemetrySnapshot
 log = logging.getLogger(__name__)
 
 _MIN_MOVE_M = 1.0
-_MAX_ATTEMPTS = 3
+_MAX_ATTEMPTS = 3         # telemetry writes (best-effort, coalescing)
+_STATE_WRITE_ATTEMPTS = 6  # command / mission state writes (must not be lost)
 _BACKOFF_CAP_S = 30.0
 _REJECT_PAUSE_S = 5.0  # pause after a non-retryable (4xx) failure
 _DRAIN_TIMEOUT_S = 2.0  # per-request timeout while flushing at shutdown
@@ -69,6 +70,7 @@ class _Outcome:
     status: int | None = None
     retryable: bool = False
     detail: str = ""
+    body: str = ""  # response body on success (when return=representation)
 
 
 class _DropOldestQueue:
@@ -225,12 +227,20 @@ class TelemetryStore:
         mission_id: str | None,
         event: str,
         detail: dict | None = None,
-    ) -> None:
-        """Queue a ``mission_events`` row, auto-stamped from the live snapshot.
+        *,
+        sync: bool = False,
+    ) -> bool:
+        """Write a ``mission_events`` row, auto-stamped from the live snapshot.
 
         lat/lon/alt/battery/voltage and link_up are filled from the current
         :class:`TelemetrySnapshot` so callers cannot forget to. Position is
-        only stamped when it is valid. Ready for v0.3+; nothing calls it yet.
+        only stamped when it is valid.
+
+        ``sync=False`` (default): enqueue on the best-effort queue -- fine for
+        high-rate informational events. ``sync=True``: write it now, retried,
+        and return whether it landed -- used for the mission's flight story so
+        the events stay ordered and are not silently dropped. Returns True on
+        an accepted enqueue or a successful sync write.
         """
         snap = self._snapshot_source()
         row = {
@@ -245,7 +255,14 @@ class TelemetryStore:
             "battery_voltage_v": snap.battery_voltage_v,
             "link_up": snap.connected,
         }
-        self._enqueue({"kind": "event", "payload": row})
+        if not sync:
+            self._enqueue({"kind": "event", "payload": row})
+            return True
+        out = self._sync_call(
+            "POST", "/rest/v1/mission_events", None, row,
+            attempts=4, what=f"mission_event {event}",
+        )
+        return out.ok
 
     @property
     def stats(self) -> dict[str, int]:
@@ -431,27 +448,30 @@ class TelemetryStore:
         )
 
     def _request(
-        self, method: str, path: str, params: dict | None, body: dict, timeout: float
+        self,
+        method: str,
+        path: str,
+        params: dict | None,
+        body: dict | None,
+        timeout: float,
+        prefer: str | None = "return=minimal",
     ) -> _Outcome:
         url = self._base + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
-        data = json.dumps(body).encode("utf-8")
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method=method,
-            headers={
-                "apikey": self._key,
-                "Authorization": f"Bearer {self._key}",
-                "Content-Type": "application/json",
-                "Prefer": "return=minimal",
-            },
-        )
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            "Content-Type": "application/json",
+        }
+        if prefer is not None:
+            headers["Prefer"] = prefer
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(request, timeout=timeout) as resp:
-                resp.read()
-                return _Outcome(ok=True, status=getattr(resp, "status", 200))
+                text = resp.read().decode("utf-8", "replace")
+                return _Outcome(ok=True, status=getattr(resp, "status", 200), body=text)
         except urllib.error.HTTPError as exc:
             detail = _read_error(exc)
             retryable = exc.code in (408, 429) or exc.code >= 500
@@ -463,6 +483,199 @@ class TelemetryStore:
                 ok=False, status=None, retryable=True,
                 detail=f"{type(exc).__name__}: {exc}",
             )
+
+    # ---------------------------------------------------- command / mission
+    #
+    # Synchronous DB operations for gss/commands.py. These run on the command
+    # intake's own threads, never the MAVLink path (R10 holds by thread
+    # isolation, same as the telemetry consumer). They retry HARDER than
+    # telemetry: a dropped telemetry update is harmless, a dropped command
+    # status write leaves a row stuck in 'accepted' forever. On final failure
+    # they return False / None and log at ERROR -- the caller retries on its
+    # next poll cycle rather than discarding.
+
+    def _sync_call(
+        self,
+        method: str,
+        path: str,
+        params: dict | None,
+        body: dict | None,
+        *,
+        prefer: str | None = "return=minimal",
+        attempts: int = _STATE_WRITE_ATTEMPTS,
+        timeout: float = 8.0,
+        what: str = "db op",
+    ) -> _Outcome:
+        delay = 1.0
+        last: _Outcome = _Outcome(ok=False, detail="not attempted")
+        for attempt in range(1, attempts + 1):
+            last = self._request(method, path, params, body, timeout, prefer)
+            if last.ok:
+                return last
+            if not last.retryable:
+                log.error(
+                    "store: %s rejected (HTTP %s), not retrying: %s",
+                    what, last.status, last.detail,
+                )
+                return last
+            if attempt < attempts:
+                log.warning(
+                    "store: %s failed (%s); retry %d/%d in %.0fs",
+                    what, last.detail, attempt, attempts - 1, delay,
+                )
+                if self._stop.wait(delay):
+                    return last
+                delay = min(delay * 2, _BACKOFF_CAP_S)
+        log.error("store: %s could not be written after %d attempts: %s",
+                  what, attempts, last.detail)
+        return last
+
+    def claim_command(
+        self, command_id: str, drone_id: str
+    ) -> tuple[bool, dict | None]:
+        """Atomically claim a pending command for this drone.
+
+        Calls the ``claim_command`` RPC (``UPDATE ... SET status='accepted',
+        acked_at=now() WHERE id=$1 AND status='pending' AND drone_id=$2
+        RETURNING *``).
+
+        Returns ``(reached_db, payload)``:
+          * ``(True,  {"command": {...}, "server_now": "<iso>"})`` -- claimed
+          * ``(True,  None)`` -- nothing to claim (already handled, not ours,
+            or gone); a normal, silent outcome
+          * ``(False, None)`` -- could not reach the database; the caller must
+            NOT mark the id seen so the poller retries it
+        """
+        out = self._sync_call(
+            "POST", "/rest/v1/rpc/claim_command", None,
+            {"p_command_id": command_id, "p_drone_id": drone_id},
+            prefer=None, what=f"claim_command({command_id})",
+        )
+        if not out.ok:
+            return False, None
+        body = out.body.strip()
+        if not body or body == "null":
+            return True, None
+        try:
+            payload = json.loads(body)
+            if isinstance(payload, str):  # some configs double-encode a jsonb return
+                payload = json.loads(payload)
+        except json.JSONDecodeError:
+            log.error("store: claim_command returned unparseable body: %r", body[:200])
+            return True, None
+        if not isinstance(payload, dict) or "command" not in payload:
+            return True, None
+        return True, payload
+
+    def update_command_status(
+        self,
+        command_id: str,
+        status: str,
+        *,
+        rejected_reason: str | None = None,
+        mission_id: str | None = None,
+    ) -> bool:
+        """PATCH a command's status (+ optional reason / mission link)."""
+        body: dict = {"status": status}
+        if rejected_reason is not None:
+            body["rejected_reason"] = rejected_reason
+        if mission_id is not None:
+            body["mission_id"] = mission_id
+        out = self._sync_call(
+            "PATCH", "/rest/v1/commands", {"id": f"eq.{command_id}"}, body,
+            what=f"command {command_id} -> {status}",
+        )
+        return out.ok
+
+    def link_command_to_mission(self, command_id: str, mission_id: str) -> bool:
+        """Set a command's mission_id."""
+        out = self._sync_call(
+            "PATCH", "/rest/v1/commands", {"id": f"eq.{command_id}"},
+            {"mission_id": mission_id},
+            what=f"link command {command_id} -> mission {mission_id}",
+        )
+        return out.ok
+
+    def create_mission(
+        self,
+        *,
+        drone_id: str,
+        mission_type: str,
+        dock_id: str | None = None,
+        target_lat: float | None = None,
+        target_lon: float | None = None,
+        cruise_alt_m: float | None = None,
+        triggered_by: str | None = None,
+    ) -> str | None:
+        """INSERT a missions row (status='queued'); return its id or None."""
+        body = {
+            "drone_id": drone_id,
+            "dock_id": dock_id,
+            "type": mission_type,
+            "status": "queued",
+            "target_lat": target_lat,
+            "target_lon": target_lon,
+            "cruise_alt_m": cruise_alt_m,
+            "triggered_by": triggered_by,
+        }
+        out = self._sync_call(
+            "POST", "/rest/v1/missions", None, body,
+            prefer="return=representation", what="create_mission",
+        )
+        if not out.ok:
+            return None
+        try:
+            rows = json.loads(out.body)
+            return rows[0]["id"]
+        except (json.JSONDecodeError, IndexError, KeyError):
+            log.error("store: create_mission returned no id: %r", out.body[:200])
+            return None
+
+    def update_mission(self, mission_id: str, **fields: object) -> bool:
+        """PATCH a missions row. Server triggers stamp started_at / ended_at."""
+        out = self._sync_call(
+            "PATCH", "/rest/v1/missions", {"id": f"eq.{mission_id}"}, dict(fields),
+            what=f"mission {mission_id} update {list(fields)}",
+        )
+        return out.ok
+
+    def list_pending_command_ids(self, drone_id: str) -> list[str]:
+        """The poller's query: ids of pending commands for this drone."""
+        out = self._sync_call(
+            "GET", "/rest/v1/commands",
+            {
+                "drone_id": f"eq.{drone_id}",
+                "status": "eq.pending",
+                "select": "id",
+                "order": "issued_at.asc",
+            },
+            None, attempts=3, timeout=6.0, what="poll pending commands",
+        )
+        if not out.ok:
+            return []
+        try:
+            return [row["id"] for row in json.loads(out.body)]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            log.error("store: pending-commands query returned junk: %r", out.body[:200])
+            return []
+
+    def list_active_missions(self, drone_id: str) -> list[dict]:
+        """Missions for this drone that are not in a terminal state."""
+        out = self._sync_call(
+            "GET", "/rest/v1/missions",
+            {
+                "drone_id": f"eq.{drone_id}",
+                "status": "not.in.(landed,aborted)",
+                "select": "id,status,type,created_at",
+            },
+            None, attempts=3, timeout=6.0, what="list active missions",
+        )
+        if not out.ok:
+            return []
+        try:
+            return list(json.loads(out.body))
+        except json.JSONDecodeError:
+            return []
 
     # ------------------------------------------------------------ drops
 

@@ -141,6 +141,16 @@ class MavlinkLink:
             return self._last_heartbeat_at
 
     @property
+    def last_data_at(self) -> datetime | None:
+        """UTC timestamp of the most recent non-HEARTBEAT, non-ACK message.
+
+        i.e. when actual telemetry (position/battery/GPS/...) last arrived, as
+        opposed to just a keep-alive heartbeat.
+        """
+        with self._lock:
+            return self._last_data_at
+
+    @property
     def system_id(self) -> int | None:
         """Autopilot MAVLink system ID once detected, else None."""
         with self._lock:

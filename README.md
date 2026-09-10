@@ -4,13 +4,15 @@ Python service that owns the MAVLink link to the drone and, in this version,
 prints live telemetry to the console. It runs on the dock's Raspberry Pi in
 production; for now it runs on Windows against ArduPilot SITL.
 
-**Scope so far:** MAVLink link with forever-reconnect, telemetry to the
-console, and (v0.2) a best-effort Supabase mirror of the telemetry plus a
-minimal live status page. The only messages the GSS transmits over MAVLink are
-telemetry stream-rate requests (see the send boundary at the top of
-`gss/link.py`); the only network calls are in `gss/store.py` and are strictly
-downstream of the flight path (rule **R10**). No arming, no mode changes, no
-command execution yet. See `PROJECT.md` for the full roadmap.
+**Scope so far:** MAVLink link with forever-reconnect and telemetry to the
+console; a best-effort Supabase mirror of the telemetry plus a live status
+page (v0.2); command intake -> **dry-run** missions (v0.3). The GSS transmits
+nothing over MAVLink but telemetry stream-rate requests (send boundary at the
+top of `gss/link.py`, rule **R11**); network calls live in `gss/store.py` and
+`gss/commands.py` and never block the flight path (rule **R10**). It does not
+arm, change mode, take off, or send a waypoint -- v0.3 walks accepted missions
+through their states on a timer and logs what a real flight *would* do.
+`safety.py` (v0.4) and a real executor (v0.5) come next. See `PROJECT.md`.
 
 ## Layout
 
@@ -20,17 +22,20 @@ gss/
   link.py         MavlinkLink: connect, receive on a daemon thread, reconnect,
                   on-connect callbacks, stream watchdog, stream-rate requests
   telemetry.py    TelemetrySnapshot + TelemetryReader: latest-known state
-  store.py        TelemetryStore: best-effort Supabase mirror (the ONLY networked module)
+  store.py        TelemetryStore: Supabase telemetry mirror + command/mission DB ops
+  commands.py     CommandIntake: Realtime + poller -> claim -> validate -> dry-run mission
+  executor.py     Executor interface + DryRunExecutor (v0.3) + make_executor()
   main.py         entry point: wire it together, print a line every 2s
 supabase/
   migrations/     the schema -- the source of truth (apply with the Supabase CLI)
 web/
-  status.html     single-file live status page (Supabase Auth + Realtime, no build step)
+  status.html     single-file live status page + command buttons (Supabase Auth + Realtime)
   config.example.js  copy to config.js (gitignored) and fill in URL + anon key
 tests/
   fake_vehicle.py     MAVLink vehicle over TCP with driveable state, clean/abrupt disconnect
-  test_v011_fixes.py  regression tests for the v0.1.1 MAVLink fixes
-  test_store.py       tests for store.py against a local mock HTTP endpoint
+  test_v011_fixes.py  MAVLink-path regressions (18)
+  test_store.py       store.py vs a local mock HTTP endpoint (24)
+  test_commands.py    v0.3 command intake vs the real Supabase project in .env (37)
 ```
 
 ## Setup (Windows)
@@ -106,8 +111,25 @@ For a local Postgres instead: `supabase start` then `supabase db reset`
 The migrations create ten tables with RLS enabled from the first migration
 (a logged-in browser may read everything and insert into `commands` only;
 every other write is the GSS using the service_role key), enable Realtime on
-`drones` and `commands`, and seed one dock + one drone whose ids match the
-`DRONE_ID` / `DOCK_ID` defaults in `gss/config.py`.
+`drones` and `commands`, seed one dock + one drone whose ids match the
+`DRONE_ID` / `DOCK_ID` defaults in `gss/config.py`, and (v0.3) add the
+`claim_command` RPC (service_role only) plus triggers that stamp
+`acked_at` / `completed_at` / `started_at` / `ended_at` with the **database**
+clock -- a Pi's clock is not trustworthy after a power cut.
+
+## Command intake (v0.3)
+
+When Supabase is on, the GSS also runs `CommandIntake`: it learns about new
+rows in `commands` two ways -- a Realtime websocket (fast) and a poll every
+`COMMAND_POLL_INTERVAL_S` (correct) -- claims each one atomically (so the two
+paths, or two GSS instances, never double-execute), validates it, and for an
+accepted `summon` / `goto` creates a mission and walks it through its states
+with the **dry-run** executor. Nothing is sent to the vehicle. Rejections
+write a specific `rejected_reason`. `abort` stops a running dry run promptly.
+
+`ALLOW_VEHICLE_CONTROL` must stay `false` -- config refuses to start otherwise,
+and the executor factory refuses to build anything but the dry runner. That is
+the guard rail until `safety.py` (v0.4) and `MavlinkExecutor` (v0.5) exist.
 
 ## Live status page
 
@@ -126,6 +148,12 @@ heading, speed and link state, updating over Realtime. If `last_telemetry_at`
 is older than 10 s it shows a prominent STALE banner instead of presenting old
 numbers as current. Last-known position is shown separately with its own
 timestamp.
+
+A **Commands** card has Summon (uses browser geolocation), Hold, Abort, and a
+deliberately-invalid "Summon 20 km away" button so you can watch a rejection
+happen. Below it, the last 10 commands with their status and `rejected_reason`,
+live over Realtime. These INSERTs into `commands` are the only writes the page
+can do.
 
 The console position label reads `POS ` when the fix is valid (real coordinates
 **and** a 3D GPS fix) and `pos?` otherwise. Stop with **Ctrl+C**.
@@ -165,9 +193,13 @@ fv.stop()
 Run the test suites:
 
 ```powershell
-python -m tests.test_v011_fixes   # MAVLink path (18 checks)
-python -m tests.test_store        # Supabase store, mock endpoint (24 checks)
+python -m tests.test_v011_fixes   # MAVLink path, fake vehicle       (18 checks)
+python -m tests.test_store        # store.py vs a local mock HTTP     (24 checks)
+python -m tests.test_commands     # v0.3 intake vs the real project   (37 checks, ~5 min)
 ```
+
+`test_commands` needs a reachable Supabase (the `.env` project) and creates /
+deletes rows for `DRONE_ID` as it runs.
 
 ### Demoing the status page with the fake vehicle
 
@@ -189,11 +221,25 @@ fv.set_position(lat=25.9, lon=85.9, fix_type=1)   # -> page shows "no valid fix"
 fv.disconnect_abrupt()                            # -> page STALE banner after 10 s
 ```
 
+## Verifying the acceptance criteria (v0.3)
+
+Run `python -m tests.test_commands` (37 checks). It covers, against the real
+project: a valid summon walking the dry-run states with battery-stamped
+events; a 20 km summon rejected with the distance and the limit in the reason;
+a past `expires_at` rejected as expired; a foreign `drone_id` left `pending`;
+a second summon rejected while one runs; the same command delivered via both
+paths executed once; a stale-link summon rejected; `abort` taking a running
+mission to `aborted` in well under a second; expiry unchanged with the local
+clock warped to 2020; and the poller alone picking a command up with Realtime
+off.
+
+`ALLOW_VEHICLE_CONTROL=true` -> the GSS refuses to start.
+
 ## Verifying the acceptance criteria (v0.2)
 
 **Database**
 
-- `supabase db push` (or `supabase db reset` locally) applies all three
+- `supabase db push` (or `supabase db reset` locally) applies all
   migrations to an empty database with no errors.
 
 **Telemetry sync**

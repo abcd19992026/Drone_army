@@ -9,10 +9,12 @@ telemetry line every ``TELEMETRY_INTERVAL_S`` seconds. If the link is down it
 keeps printing a "link down" line and the background thread keeps retrying --
 the process does not exit. Ctrl+C shuts down cleanly.
 
-When ``SUPABASE_ENABLED`` is true it also starts :class:`~gss.store.TelemetryStore`,
-which mirrors telemetry into the database on its own threads. That path is
-strictly best-effort (rule R10): if it is slow, failing, or disabled, the
-console output above is byte-for-byte unchanged.
+When ``SUPABASE_ENABLED`` is true it also starts
+:class:`~gss.store.TelemetryStore` (telemetry mirror) and
+:class:`~gss.commands.CommandIntake` (command intake -> dry-run missions),
+each on its own threads. Both are strictly downstream of the MAVLink path
+(rule R10): if they are slow, failing, or disabled, the console output above
+is byte-for-byte unchanged.
 """
 
 from __future__ import annotations
@@ -45,11 +47,14 @@ def run() -> int:
     link = MavlinkLink()
     reader = TelemetryReader(link)
     store = _make_store(reader)
+    intake = _make_intake(store, reader)
     shutdown = threading.Event()
 
     try:
         if store is not None:
             store.start()
+        if intake is not None:
+            intake.start()
 
         # Give the link a short grace period so the first console line is
         # usually populated, but never block the telemetry loop on it -- the
@@ -65,6 +70,9 @@ def run() -> int:
     except KeyboardInterrupt:
         log.info("Ctrl+C received, shutting down.")
     finally:
+        if intake is not None:
+            log.info("Stopping command intake...")
+            intake.close(timeout_s=5.0)
         if store is not None:
             log.info("Flushing Supabase queue...")
             store.close(timeout_s=5.0)
@@ -89,6 +97,27 @@ def _make_store(reader: TelemetryReader):
         return TelemetryStore(reader.get_snapshot)
     except Exception:
         log.exception("Could not initialise Supabase sync; continuing without it")
+        return None
+
+
+def _make_intake(store, reader: TelemetryReader):
+    """Build the command intake, or None. Requires the store (Supabase).
+
+    A construction failure is logged and downgraded to None -- the GSS still
+    flies the drone and prints to the console (R10).
+    """
+    if store is None:
+        if config.SUPABASE_ENABLED:
+            log.warning("Command intake needs Supabase; the store failed, so intake is off.")
+        else:
+            log.info("Command intake disabled (Supabase off).")
+        return None
+    try:
+        from gss.commands import CommandIntake
+
+        return CommandIntake(store, reader.get_snapshot)
+    except Exception:
+        log.exception("Could not initialise command intake; continuing without it")
         return None
 
 

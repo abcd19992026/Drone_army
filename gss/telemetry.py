@@ -85,7 +85,8 @@ class TelemetrySnapshot:
     battery_current_a: float | None
     gps_fix_type: int | None
     gps_satellites: int | None
-    link_age_s: float | None
+    link_age_s: float | None       # seconds since the last HEARTBEAT
+    telemetry_age_s: float | None  # seconds since the last real telemetry message
 
 
 class TelemetryReader:
@@ -225,6 +226,10 @@ class TelemetryReader:
             if last_heartbeat is not None
             else None
         )
+        last_data = self._link.last_data_at
+        telemetry_age_s = (
+            (now - last_data).total_seconds() if last_data is not None else None
+        )
         with self._lock:
             fix = self._gps_fix_type
             position_valid = (
@@ -251,6 +256,7 @@ class TelemetryReader:
                 gps_fix_type=fix,
                 gps_satellites=self._gps_satellites,
                 link_age_s=link_age_s,
+                telemetry_age_s=telemetry_age_s,
             )
 
 

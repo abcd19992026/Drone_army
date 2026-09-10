@@ -108,7 +108,7 @@ def _snap(*, lat=25.5932, lon=85.2045, battery=90.0, mode="STABILIZE",
         position_valid=position_valid, alt_m_amsl=584.0, alt_m_relative=0.0,
         heading_deg=90.0, groundspeed_ms=0.0, mode=mode, armed=False,
         battery_pct=battery, battery_voltage_v=volts, battery_current_a=0.0,
-        gps_fix_type=fix, gps_satellites=11, link_age_s=age,
+        gps_fix_type=fix, gps_satellites=11, link_age_s=age, telemetry_age_s=age,
     )
 
 
