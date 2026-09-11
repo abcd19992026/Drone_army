@@ -6,21 +6,35 @@ callbacks, fires on-connect callbacks after every successful (re)connection,
 runs a stream watchdog, and reconnects with exponential backoff. Losing the
 link never raises out of the thread and never calls ``sys.exit`` (R5, R8).
 
-SEND BOUNDARY -- amended in v0.1.1, do not widen it here
--------------------------------------------------------
-This module may send exactly ONE category of MAVLink message: telemetry
-stream-rate requests --
+SEND BOUNDARY -- amended in v0.1.1, and again in v0.6
+----------------------------------------------------
+Through v0.5 this module sent exactly ONE category of message: telemetry
+stream-rate requests (MAV_CMD_SET_MESSAGE_INTERVAL 511, REQUEST_DATA_STREAM).
+Those ask the vehicle to *report* data.
 
-    * MAV_CMD_SET_MESSAGE_INTERVAL (511), via COMMAND_LONG
-    * REQUEST_DATA_STREAM
+v0.6 adds three things and NOTHING else:
 
-These ask the vehicle to *report* data. They do not arm, disarm, actuate,
-change flight mode, take off, upload or start missions, trigger RTL, or write
-parameters. Nothing else may be transmitted from ``link.py`` or
-``telemetry.py`` -- no other MAV_CMD, no COMMAND_INT, no MISSION_*, no
-PARAM_SET, no manual control. Command sending (arm / mode / goto / RTL / ...)
-will live in its own module in v0.3, behind the safety veto. A future session
-must not add other sends to this file.
+  * :meth:`transmit` -- a single generic passthrough for a flight command,
+    gated on ``config.ALLOW_VEHICLE_CONTROL``. Its ONLY caller is
+    ``gss.mission.MavlinkExecutor``, which funnels every transmit through its
+    own single chokepoint. link.py does not build flight commands, decide
+    anything, or retry -- it just serialises the bytes onto the wire.
+  * :meth:`read_params` -- PARAM_REQUEST_READ + collecting PARAM_VALUE. A
+    READ only. This module still never writes a parameter (no PARAM_SET), and
+    ``transmit`` must not be used for one either.
+  * :meth:`request_home_position` -- MAV_CMD_GET_HOME_POSITION. Found needed
+    against real SITL (2026-09-11): like the stream-rate requests above, this
+    ASKS the vehicle to report something it already holds -- it does not
+    control anything -- so it sits in the same "request, not command"
+    category the stream-rate requests already established, not a widening of
+    the boundary. ArduPilot only broadcasts HOME_POSITION when its home
+    changes, never to a GCS that merely connects later, so a GSS joining an
+    already-running vehicle (restart, or this test) would otherwise wait
+    forever. See :meth:`register_watchdog_check`.
+
+Still forbidden here: building an arm / mode / takeoff / goto / RTL message,
+MISSION_* upload, PARAM_SET, manual control. Those live in ``gss.mission``.
+A future session must not add other sends to this file.
 """
 
 from __future__ import annotations
@@ -116,11 +130,18 @@ class MavlinkLink:
 
         # command -> (result, monotonic_time); populated from COMMAND_ACK.
         self._command_acks: dict[int, tuple[int, float]] = {}
+        # param name -> value; populated from PARAM_VALUE (v0.6 failsafe audit).
+        self._params: dict[str, float] = {}
 
         self._callbacks: list[MessageCallback] = []
         self._callbacks_lock = threading.Lock()
         self._on_connect: list[ConnectCallback] = []
         self._on_connect_lock = threading.Lock()
+        # Extra "is this still missing" predicates the stream watchdog also
+        # considers, for a response that arrives once-per-request rather than
+        # as a periodic stream (HOME_POSITION) -- see register_watchdog_check.
+        self._watchdog_checks: list[tuple[str, Callable[[], bool]]] = []
+        self._watchdog_checks_lock = threading.Lock()
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -181,6 +202,22 @@ class MavlinkLink:
         """
         with self._on_connect_lock:
             self._on_connect.append(callback)
+
+    def register_watchdog_check(self, name: str, is_missing: Callable[[], bool]) -> None:
+        """Register an extra staleness check for the stream watchdog.
+
+        Plain telemetry silence (:meth:`_check_stream_watchdog`'s original
+        check) misses a response that only ever arrives once per request --
+        HOME_POSITION being the case that surfaced this: every OTHER stream
+        keeps flowing fine, so overall telemetry never looks stale, and the
+        one message that never came stays missing forever. ``is_missing`` is
+        polled from the watchdog (never the receive thread) and, like the
+        plain staleness check, is rate-limited by STREAM_REREQUEST_MIN_S and
+        re-fires every on-connect callback (not just this one thing) when it
+        returns True after STREAM_WATCHDOG_S.
+        """
+        with self._watchdog_checks_lock:
+            self._watchdog_checks.append((name, is_missing))
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -279,6 +316,91 @@ class MavlinkLink:
                 tgt_sys, tgt_comp, stream_id, req_rate, start
             )
         )
+
+    def request_home_position(self) -> bool:
+        """Ask the vehicle to (re-)send HOME_POSITION now (MAV_CMD_GET_HOME_
+        POSITION). A REQUEST for information the vehicle already holds, in the
+        same category as :meth:`request_message_interval` above -- see the
+        module docstring. Fire-and-forget like :meth:`request_data_stream`:
+        the actual confirmation is the HOME_POSITION message itself arriving
+        (handled by whichever callback is watching for it), not an ACK to
+        this command.
+        """
+        cmd = mavutil.mavlink.MAV_CMD_GET_HOME_POSITION
+        with self._lock:
+            conn = self._conn
+            tgt_sys = self._system_id or 0
+            tgt_comp = self._component_id or 0
+        if conn is None:
+            return False
+        return self._send(
+            lambda: conn.mav.command_long_send(
+                tgt_sys, tgt_comp, cmd, 0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            )
+        )
+
+    # --- flight commands (v0.6) -- ONE generic passthrough, gated ----------
+
+    def transmit(self, build_send: Callable[[Any], None], *, what: str,
+                 clear_ack_for: int | None = None) -> bool:
+        """Serialise ONE flight-command send onto the wire.
+
+        The only caller is :class:`gss.mission.MavlinkExecutor`, through its own
+        single chokepoint. ``build_send`` receives the live connection object
+        (``.mav`` / ``.target_system`` / ``.target_component``) and must perform
+        exactly one send. Gated on ``config.ALLOW_VEHICLE_CONTROL``: refuses and
+        logs otherwise. link.py builds nothing and retries nothing.
+        """
+        if not config.ALLOW_VEHICLE_CONTROL:
+            log.error(
+                "link.transmit(%s) refused: ALLOW_VEHICLE_CONTROL is false", what
+            )
+            return False
+        with self._lock:
+            conn = self._conn
+            if clear_ack_for is not None:
+                self._command_acks.pop(clear_ack_for, None)
+        if conn is None:
+            log.warning("link.transmit(%s): link is down", what)
+            return False
+        return self._send(lambda: build_send(conn))
+
+    def command_ack(self, command: int) -> tuple[int, float] | None:
+        """The most recent COMMAND_ACK for ``command`` as (result, monotonic),
+        or None. mission.py uses this to confirm arm / mode changes."""
+        with self._lock:
+            return self._command_acks.get(command)
+
+    def read_params(
+        self, names: "list[str]", timeout_s: float = 5.0
+    ) -> dict[str, float | None]:
+        """PARAM_REQUEST_READ each of ``names`` and collect the PARAM_VALUE
+        replies. A READ only -- never PARAM_SET. Missing params come back None."""
+        with self._lock:
+            conn = self._conn
+            tgt_sys = self._system_id or 0
+            tgt_comp = self._component_id or 0
+            for n in names:
+                self._params.pop(n, None)
+        if conn is None:
+            return {n: None for n in names}
+        for n in names:
+            self._send(
+                lambda n=n: conn.mav.param_request_read_send(
+                    tgt_sys, tgt_comp, n.encode("ascii")[:16], -1
+                )
+            )
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                have = {n: self._params.get(n) for n in names}
+            if all(v is not None for v in have.values()):
+                return have
+            if self._stop.wait(0.1):
+                break
+        with self._lock:
+            return {n: self._params.get(n) for n in names}
 
     def _send(self, send_fn: Callable[[], None]) -> bool:
         """Serialise one transmit through ``_tx_lock``; swallow a dead socket."""
@@ -394,6 +516,7 @@ class MavlinkLink:
             self._system_id = system_id
             self._component_id = component_id
             self._command_acks.clear()
+            self._params.clear()
         log.info(
             "Link up. system=%d component=%d autopilot=%s",
             system_id, component_id, autopilot_name,
@@ -460,13 +583,18 @@ class MavlinkLink:
                 with self._lock:
                     self._last_heartbeat_at = now
             elif message_type == "COMMAND_ACK":
-                # A COMMAND_ACK is the vehicle answering our own stream request,
+                # A COMMAND_ACK is the vehicle answering one of our commands,
                 # not telemetry -- it must not reset the stream watchdog.
                 with self._lock:
                     self._command_acks[message.command] = (
                         message.result,
                         time.monotonic(),
                     )
+            elif message_type == "PARAM_VALUE":
+                # Answer to read_params(). A read only -- link.py never sends
+                # PARAM_SET. Not telemetry; does not reset the watchdog.
+                with self._lock:
+                    self._params[str(message.param_id)] = float(message.param_value)
             else:
                 with self._lock:
                     self._last_data_at = now
@@ -521,11 +649,20 @@ class MavlinkLink:
                 log.exception("on-connect callback %s raised [%s]", name, reason)
 
     def _check_stream_watchdog(self) -> None:
-        """Re-request streams if the link is up but telemetry has gone silent.
+        """Re-request streams if the link is up but telemetry has gone silent,
+        or if a registered once-per-request check (see
+        :meth:`register_watchdog_check`) is still missing after the same
+        STREAM_WATCHDOG_S window.
 
         HEARTBEAT keeps arriving on a healthy link even when ArduPilot has
-        stopped streaming position/battery, so this is the only thing that
-        catches that failure mode. Rate-limited by STREAM_REREQUEST_MIN_S.
+        stopped streaming position/battery, so plain silence is the only
+        thing that catches THAT failure mode -- but a registered check is
+        needed for the opposite shape of failure: every periodic stream flows
+        fine (so telemetry never looks stale) while one once-only response
+        never arrived. Both paths are rate-limited by STREAM_REREQUEST_MIN_S,
+        sharing the same timer, and both re-fire every on-connect callback
+        (cheap and idempotent -- re-requesting an already-flowing stream is a
+        no-op) rather than something more targeted.
         """
         with self._lock:
             last_data = self._last_data_at
@@ -533,7 +670,19 @@ class MavlinkLink:
         if last_data is None:
             return
         data_age = (datetime.now(timezone.utc) - last_data).total_seconds()
-        if data_age < config.STREAM_WATCHDOG_S:
+        stale = data_age >= config.STREAM_WATCHDOG_S
+
+        with self._watchdog_checks_lock:
+            checks = list(self._watchdog_checks)
+        missing: list[str] = []
+        for name, is_missing in checks:
+            try:
+                if is_missing():
+                    missing.append(name)
+            except Exception:
+                log.exception("watchdog check %r raised", name)
+
+        if not stale and not missing:
             return
         mono = time.monotonic()
         if (
@@ -541,11 +690,18 @@ class MavlinkLink:
             and mono - last_request < config.STREAM_REREQUEST_MIN_S
         ):
             return
-        log.warning(
-            "Stream watchdog: no telemetry for %.1fs on a live link; "
-            "re-requesting streams",
-            data_age,
-        )
+        if stale:
+            log.warning(
+                "Stream watchdog: no telemetry for %.1fs on a live link; "
+                "re-requesting streams",
+                data_age,
+            )
+        if missing:
+            log.warning(
+                "Stream watchdog: still missing %s after %.0fs on a live "
+                "link; re-requesting",
+                ", ".join(missing), config.STREAM_WATCHDOG_S,
+            )
         self._launch_connect_callbacks("stream watchdog")
 
     # --- helpers ---------------------------------------------------------

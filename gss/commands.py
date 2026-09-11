@@ -71,6 +71,12 @@ _SAFETY_ACTIONABLE = frozenset(
     }
 )
 
+# Every action _consult_safety below has an explicit mission_events/alert
+# branch for. Kept separate from _SAFETY_ACTIONABLE (even though the two are
+# identical today) so if that set ever grows without a matching branch here,
+# the mismatch is caught loudly instead of silently falling through.
+_SAFETY_ACTIONS_WITH_BRANCHES = frozenset(_SAFETY_ACTIONABLE)
+
 # The commands.type CHECK set (keep in sync with the schema migration).
 _KNOWN_COMMAND_TYPES = frozenset({
     "summon", "goto", "perch", "return", "land", "abort", "hold", "takeoff",
@@ -307,9 +313,21 @@ class CommandIntake:
         realtime_enabled: bool = True,
         safety: SafetyMonitor | None = None,
         weather: WeatherMonitor | None = None,
+        link=None,
+        adopted_detail: dict | None = None,
     ) -> None:
         self._store = store
         self._snapshot = snapshot_source
+        # v0.6: the MAVLink link, so make_executor() can build a real
+        # MavlinkExecutor. None while ALLOW_VEHICLE_CONTROL is false -- the
+        # factory never needs it for the dry runner.
+        self._link = link
+        # v0.6: if main.py's startup check (mission.recover_airborne_vehicle,
+        # run BEFORE this object exists) found the vehicle armed and airborne
+        # with no software flying it, this carries what it found and did --
+        # _reconcile_orphan_missions uses it to tell the DB the truth instead
+        # of the generic "orphaned" message.
+        self._adopted_detail = adopted_detail
         self._drone_id = drone_id or config.DRONE_ID
         self._dock_id = dock_id or config.DOCK_ID
         self._home_lat = home_lat if home_lat is not None else config.HOME_LAT
@@ -419,12 +437,24 @@ class CommandIntake:
         self._stop.set()
         with self._active_lock:
             active = self._active
+        real_flight = active is not None and not isinstance(active.executor, DryRunExecutor)
         if active is not None:
-            # DRY RUN only: nothing is flying, so ending the mission here is
-            # safe and keeps the DB clean for the next run. A real executor
-            # (v0.5) must NOT be aborted on GSS shutdown -- the drone keeps
-            # flying its onboard mission and the GSS re-attaches (R5).
-            active.executor.abort("GSS stopped")
+            if real_flight:
+                # A REAL flight may be airborne. Do NOT abort it here -- the
+                # vehicle keeps flying its last GUIDED setpoint / ArduPilot's
+                # own failsafes, and a restart adopts + reconciles it (R5).
+                # Just stop watching; nothing is transmitted by this call.
+                log.warning(
+                    "mission %s: GSS stopping with a REAL flight in progress -- "
+                    "leaving it flying, database status unchanged. A restart "
+                    "will adopt it and order RTL if it is still airborne.",
+                    active.mission_id,
+                )
+                active.executor.close()
+            else:
+                # DRY RUN only: nothing is flying, so ending the mission here is
+                # safe and keeps the DB clean for the next run.
+                active.executor.abort("GSS stopped")
         deadline = time.monotonic() + timeout_s
         for thread in self._threads:
             thread.join(timeout=max(0.05, deadline - time.monotonic()))
@@ -432,11 +462,12 @@ class CommandIntake:
             active = self._active
             awaiting = self._awaiting
         if active is not None:
-            self._store.update_mission(
-                active.mission_id, status="aborted",
-                abort_reason="GSS stopped during dry run",
-            )
-            self._store.update_command_status(active.command_id, "done")
+            if not real_flight:
+                self._store.update_mission(
+                    active.mission_id, status="aborted",
+                    abort_reason="GSS stopped during dry run",
+                )
+                self._store.update_command_status(active.command_id, "done")
             self._active = None
         if awaiting is not None:
             self._store.update_mission(
@@ -695,15 +726,27 @@ class CommandIntake:
     ) -> None:
         """Build the executor, register the mission as active, and start it.
         Shared by a fresh accept and a launch-after-weather-confirmation."""
+        params = cmd.get("params") if isinstance(cmd.get("params"), dict) else {}
         executor = self._executor_factory(
             mission_id, cmd, self._snapshot,
             allow_vehicle_control=self._allow_vehicle_control,
             on_station_alt_m=self._on_station_alt_m,
+            link=self._link,
+            safety=self._safety,
+            weather=self._weather,
+            home_lat=self._home_lat,
+            home_lon=self._home_lon,
+            loiter_seconds=params.get("loiter_seconds"),
         )
-        if not isinstance(executor, DryRunExecutor):
+        # Guard rail, kept in both directions: ALLOW_VEHICLE_CONTROL false must
+        # never produce anything but the dry runner, and true must never
+        # silently fall back to it (v0.6).
+        expect_dry_run = not self._allow_vehicle_control
+        if isinstance(executor, DryRunExecutor) != expect_dry_run:
             raise RuntimeError(
-                "refusing a non-dry-run executor in v0.5 "
-                f"(got {type(executor).__name__})"
+                f"executor/ALLOW_VEHICLE_CONTROL mismatch: allow_vehicle_control="
+                f"{self._allow_vehicle_control} but make_executor() returned "
+                f"{type(executor).__name__}"
             )
 
         is_emergency = weather.is_emergency_mission(mission_type)
@@ -1065,13 +1108,26 @@ class CommandIntake:
         if active is None:
             self._reject(command_id, "no mission is running -- nothing to hold")
             return
-        log.warning(
-            "[DRY RUN] mission %s: would HOLD position now (command %s)",
-            active.mission_id, command_id,
-        )
+        is_dry_run = isinstance(active.executor, DryRunExecutor)
+        if is_dry_run:
+            log.warning(
+                "[DRY RUN] mission %s: would HOLD position now (command %s)",
+                active.mission_id, command_id,
+            )
+        else:
+            # v0.6 has no 'resume' command to release a commanded hold, so a
+            # REAL flight is NOT held here -- only safety.py's own HOLD (which
+            # safety.py itself clears) reaches the executor. Recorded honestly
+            # rather than silently stranding a real mission with no way out.
+            log.warning(
+                "mission %s: commanded HOLD (command %s) noted but NOT sent to "
+                "the executor -- v0.6 has no 'resume' command to release it on a "
+                "real flight; safety.py's own directives still apply",
+                active.mission_id, command_id,
+            )
         self._store.log_event(
             active.mission_id, "loiter_start",
-            detail={"dry_run": True, "hold_command": command_id, "note": "commanded hold"},
+            detail={"dry_run": is_dry_run, "hold_command": command_id, "note": "commanded hold"},
             sync=True,
         )
         self._set_status(command_id, "done")
@@ -1130,18 +1186,21 @@ class CommandIntake:
                 )
                 phase = active.executor.poll()
 
+        # Extra events the executor itself produced (standoff computed or
+        # recomputed, a GPS-only landing note, ...) -- written off the flight
+        # path, like every other mission_events row, regardless of a phase change.
+        for event_name, detail in active.executor.drain_events():
+            self._store.log_event(active.mission_id, event_name, detail=detail, sync=True)
+
         if phase == active.last_phase:
             return
 
-        would = (
-            active.executor.describe_phase(phase)
-            if isinstance(active.executor, DryRunExecutor)
-            else None
-        )
+        is_dry_run = isinstance(active.executor, DryRunExecutor)
+        would = active.executor.describe_phase(phase) if is_dry_run else None
         for event_name in PHASE_EVENTS.get(phase, ()):
             self._store.log_event(
                 active.mission_id, event_name,
-                detail={"dry_run": True, "phase": phase.value, "would": would},
+                detail={"dry_run": is_dry_run, "phase": phase.value, "would": would},
                 sync=True,
             )
         fields: dict[str, object] = {"status": phase.value}
@@ -1149,8 +1208,9 @@ class CommandIntake:
             fields["abort_reason"] = active.executor.abort_reason or "aborted"
         self._store.update_mission(active.mission_id, **fields)
         log.info(
-            "mission %s: %s -> %s  [DRY RUN]%s",
+            "mission %s: %s -> %s  [%s]%s",
             active.mission_id, active.last_phase.value, phase.value,
+            "DRY RUN" if is_dry_run else "REAL FLIGHT",
             f"  ({would})" if would else "",
         )
         active.last_phase = phase
@@ -1160,13 +1220,14 @@ class CommandIntake:
 
     def _consult_safety(self, active: _ActiveMission) -> None:
         """Every supervisor tick: ask safety.py, and drive the executor on its
-        verdict. RTL_NOW / LAND_NOW -> abort the dry run; HOLD / DESCEND ->
-        record what a real executor (v0.6) would do. A 'safety_veto'
-        mission_event carries the full reason list.
+        verdict via ``Executor.on_safety_action`` -- HOLD / DESCEND / RTL_NOW /
+        DIVERT / LAND_NOW. A dry run logs what it would do; MavlinkExecutor
+        (v0.6) actually flies the manoeuvre, interrupting one already in
+        progress. A 'safety_veto' mission_event carries the full reason list.
 
-        Every actionable verdict is handled EXPLICITLY -- an unrecognised
-        action is a loud error that aborts (fail safe), never a silent
-        fall-through."""
+        Every actionable verdict is handled EXPLICITLY here for logging/alerts
+        -- an unrecognised action is still a loud error, and on_safety_action's
+        own default (abort) makes it fail safe regardless."""
         self._safety.set_context(
             self._safety_context(active.command, active.mission_id, active.last_phase)
         )
@@ -1175,6 +1236,25 @@ class CommandIntake:
             # Safety is nominal (ALLOW/WARN). Clear the marker so a later
             # actionable verdict re-logs, and so weather.py may be consulted
             # again (it is skipped while safety has ordered anything).
+            if active.last_safety_action is not None:
+                # It was actionable a moment ago (HOLD/DESCEND, most likely --
+                # RTL_NOW/DIVERT/LAND_NOW end the mission and stop ticking
+                # here). Tell the executor so it can RELEASE the manoeuvre --
+                # see Executor.on_safety_action's ALLOW/WARN handling. Without
+                # this a HOLD/DESCEND, once ordered, could never clear on its
+                # own: nothing else in this dispatch ever calls
+                # on_safety_action with a lower-ranked directive (real-SITL
+                # finding, v0.6.1).
+                try:
+                    active.executor.on_safety_action(
+                        verdict.action.value,
+                        "safety clear -- verdict returned to nominal",
+                    )
+                except Exception:  # noqa: BLE001 -- never let this break the tick loop
+                    log.exception(
+                        "mission %s: executor.on_safety_action(%s) failed",
+                        active.mission_id, verdict.action.value,
+                    )
             active.last_safety_action = None
             return
         if verdict.action == active.last_safety_action:
@@ -1195,12 +1275,21 @@ class CommandIntake:
             },
             sync=True,
         )
+        if verdict.action not in _SAFETY_ACTIONS_WITH_BRANCHES:
+            # _SAFETY_ACTIONABLE grew a member with no branch below. Do not
+            # guess -- say so loudly. on_safety_action's default (abort) still
+            # runs at the bottom, so this fails safe rather than falling through.
+            log.error(
+                "mission %s: safety action %r is in _SAFETY_ACTIONABLE with no "
+                "explicit branch in _consult_safety -- a branch is missing",
+                active.mission_id, verdict.action,
+            )
+
         if verdict.action == SafetyAction.DIVERT:
-            # Home is not reachable with the battery available. A real executor
-            # (v0.6) flies to the named safe spot and lands; the dry run ends
-            # here like an RTL. Say WHERE and WHY, loudly, with the numbers --
-            # if the drone lands away from its dock, whoever is looking for it
-            # needs that immediately.
+            # Home is not reachable with the battery available. The executor
+            # flies to the named safe spot and lands. Say WHERE and WHY,
+            # loudly, with the numbers -- if the drone lands away from its
+            # dock, whoever is looking for it needs that immediately.
             tgt = verdict.divert_target or {}
             self._store.log_event(
                 active.mission_id, "divert",
@@ -1227,46 +1316,46 @@ class CommandIntake:
                 sync=True,
             )
             self._write_divert_alert(active, verdict, diverting=True)
-            active.executor.abort(f"safety veto (DIVERT): {reasons}")
-        elif verdict.action in (SafetyAction.RTL_NOW, SafetyAction.LAND_NOW):
-            if verdict.action == SafetyAction.LAND_NOW and (
-                verdict.divert_target or {}
-            ).get("nowhere_reachable"):
-                # Landing where it is because nothing was reachable -- the
-                # worst case, and the one where the beacon (Phase 14) matters
-                # most. The alert must say so, with the last position.
-                self._write_divert_alert(active, verdict, diverting=False)
-            active.executor.abort(f"safety veto ({verdict.action.value}): {reasons}")
+        elif verdict.action == SafetyAction.LAND_NOW and (
+            verdict.divert_target or {}
+        ).get("nowhere_reachable"):
+            # Landing where it is because nothing was reachable -- the worst
+            # case, and the one where the beacon (Phase 14) matters most. The
+            # alert must say so, with the last position.
+            self._write_divert_alert(active, verdict, diverting=False)
         elif verdict.action == SafetyAction.HOLD:
             self._store.log_event(
                 active.mission_id, "loiter_start",
-                detail={"dry_run": True, "note": "safety HOLD", "reasons": list(verdict.reasons)},
+                detail={"note": "safety HOLD", "reasons": list(verdict.reasons)},
                 sync=True,
             )
         elif verdict.action == SafetyAction.DESCEND:
-            # v0.4 is dry-run: log what v0.6's real executor will do. The
-            # mission is not aborted -- DESCEND means correct the altitude and
-            # keep going.
-            log.warning(
-                "[DRY RUN] mission %s: would stop horizontal progress and "
-                "descend to a safe altitude -- %s", active.mission_id, reasons,
-            )
             self._store.log_event(
                 active.mission_id, "loiter_start",
-                detail={"dry_run": True, "note": "safety DESCEND",
+                detail={"note": "safety DESCEND",
                         "would": "stop and descend below MAX_ALT_M",
                         "reasons": list(verdict.reasons)},
                 sync=True,
             )
-        else:
-            # A new SafetyAction was added to _SAFETY_ACTIONABLE without a
-            # branch here. Do not guess -- fail safe and make it visible.
-            log.error(
-                "mission %s: unhandled safety action %r -- aborting the dry run "
-                "(a branch is missing in _consult_safety)",
-                active.mission_id, verdict.action,
-            )
-            active.executor.abort(f"unhandled safety action {verdict.action.value}: {reasons}")
+
+        # Drive the executor. ONE call, for every action, known or not: the
+        # dry runner keeps its finer HOLD/DESCEND-log-only behaviour and aborts
+        # on everything else; MavlinkExecutor (v0.6) actually flies the
+        # manoeuvre. This is what makes "fail safe on an unrecognised action"
+        # true regardless of which executor is behind it.
+        #
+        # "safety veto" is prefixed here (not folded into `reasons` above,
+        # which also feeds the mission_event/log lines verbatim) so an
+        # abort_reason on a real mission always says WHO ordered it -- the
+        # same way weather's own abort text starts "weather return (...)":
+        # a human reading missions.abort_reason later must be able to tell
+        # "safety.py overruled this" from "weather told it to come home"
+        # without cross-referencing mission_events.
+        active.executor.on_safety_action(
+            verdict.action.value, f"safety veto -- {reasons}",
+            divert_spot=verdict.divert_target,
+            hold_kind=verdict.hold_kind,
+        )
 
     def _write_divert_alert(
         self, active: _ActiveMission, verdict, *, diverting: bool
@@ -1329,8 +1418,9 @@ class CommandIntake:
             if self._active is active:
                 self._active = None
         log.info(
-            "mission %s complete (%s); command %s -> done.  [DRY RUN]",
+            "mission %s complete (%s); command %s -> done.  [%s]",
             active.mission_id, phase.value, active.command_id,
+            "DRY RUN" if isinstance(active.executor, DryRunExecutor) else "REAL FLIGHT",
         )
 
     # ---------------------------------------------------------- poller
@@ -1347,16 +1437,36 @@ class CommandIntake:
             self._stop.wait(self._poll_interval_s)
 
     def _reconcile_orphan_missions(self) -> None:
+        """Missions left non-terminal by a previous GSS process.
+
+        v0.6: if ``mission.recover_airborne_vehicle`` (run at startup, BEFORE
+        this object even existed) found the vehicle armed and airborne with no
+        software flying it, ``self._adopted_detail`` carries what it found and
+        whether RTL was sent. That is the truth this writes -- not the old
+        blanket "orphaned" message, which would have been a lie about a vehicle
+        that is (we hope) actively flying home right now.
+        """
         for mission in self._store.list_active_missions(self._drone_id):
-            log.warning(
-                "startup: mission %s is %r with no running executor -- marking "
-                "aborted (orphaned by a GSS restart)",
-                mission.get("id"), mission.get("status"),
-            )
-            self._store.update_mission(
-                mission["id"], status="aborted",
-                abort_reason="orphaned: GSS restarted while the mission was non-terminal",
-            )
+            mid = mission["id"]
+            if self._adopted_detail is not None:
+                reason = (
+                    "GSS restart: vehicle was found ARMED and airborne at "
+                    f"{self._adopted_detail.get('alt_m_relative')} m relative -- "
+                    f"adopted, RTL "
+                    f"{'sent' if self._adopted_detail.get('rtl_sent') else 'NOT sent (see log)'}"
+                )
+                log.critical("startup: mission %s adopted mid-air -- %s", mid, reason)
+                self._store.log_event(
+                    mid, "vehicle_adopted", detail=self._adopted_detail, sync=True,
+                )
+            else:
+                reason = "orphaned: GSS restarted while the mission was non-terminal"
+                log.warning(
+                    "startup: mission %s is %r with no running executor -- marking "
+                    "aborted (orphaned by a GSS restart)",
+                    mid, mission.get("status"),
+                )
+            self._store.update_mission(mid, status="aborted", abort_reason=reason)
 
     # ---------------------------------------------------------- status writes
 

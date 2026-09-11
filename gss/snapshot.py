@@ -87,6 +87,13 @@ class TelemetrySnapshot:
     wind_age_s: float | None = None             # since the last WIND / WIND_COV
     vibration_age_s: float | None = None        # since the last VIBRATION
 
+    # --- arming / flight readiness (v0.6) ----------------------------------
+    # mission.py's pre-arm gate reads these. ``None`` = not reported yet, and a
+    # gate treats "not reported" as "not ready" (fail safe).
+    ekf_healthy: bool | None = None              # EKF_STATUS_REPORT flags OK
+    home_set: bool | None = None                 # HOME_POSITION received
+    prearm_fail_text: str | None = None          # most recent "PreArm: ..." STATUSTEXT, if fresh
+
 
 @dataclass(frozen=True)
 class SafeSpot:

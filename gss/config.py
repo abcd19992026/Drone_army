@@ -74,6 +74,21 @@ def _get_bool(name: str, default: bool) -> bool:
     )
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_loopback_sitl(conn: str) -> bool:
+    """True if ``conn`` is a loopback TCP/UDP MAVLink endpoint -- i.e. SITL on
+    this machine. A serial port (``COM3``, ``/dev/ttyACM0``) or a non-loopback
+    address is a real vehicle and needs the second switch (v0.6)."""
+    s = conn.strip().lower()
+    scheme, sep, rest = s.partition(":")
+    if not sep or scheme not in {"tcp", "udp", "tcpin", "udpin", "udpout", "tcpout"}:
+        return False
+    host = rest.split(":", 1)[0].strip("/[]")
+    return host in _LOOPBACK_HOSTS
+
+
 def _looks_like_uuid(value: str) -> bool:
     """True if ``value`` is a canonical 8-4-4-4-12 hex UUID string."""
     parts = value.split("-")
@@ -98,6 +113,13 @@ CRUISE_ALT_INBOUND: float = _get_float("CRUISE_ALT_INBOUND", 45.0)
 CRUISE_ALT_OUTBOUND: float = _get_float("CRUISE_ALT_OUTBOUND", 55.0)
 ON_STATION_ALT: float = _get_float("ON_STATION_ALT", 28.0)
 LATERAL_OFFSET_M: float = _get_float("LATERAL_OFFSET_M", 12.0)
+# The real-SITL pass (2026-09) landed the standoff point 11 m from the human --
+# inside the 12 m R2 boundary from ordinary GPS/arrival noise alone, because
+# the standoff computation targeted LATERAL_OFFSET_M exactly, with nothing to
+# spare. mission.py's _compute_standoff() now targets LATERAL_OFFSET_M plus
+# this margin. Zero margin against a real GPS fix and a hovering aircraft's
+# natural drift is not a safe target -- it is where that defect came from.
+STANDOFF_MARGIN_M: float = _get_float("STANDOFF_MARGIN_M", 4.0)
 
 # --- Geofence ------------------------------------------------------------
 MAX_RADIUS_M: float = _get_float("MAX_RADIUS_M", 6000.0)
@@ -158,10 +180,46 @@ COMMAND_DEFAULT_TTL_S: float = _get_float("COMMAND_DEFAULT_TTL_S", 120.0)
 TELEMETRY_MAX_AGE_S: float = _get_float("TELEMETRY_MAX_AGE_S", 10.0)
 MISSION_MAX_DURATION_S: float = _get_float("MISSION_MAX_DURATION_S", 900.0)
 
-# Guard rail: MUST stay false until safety.py (v0.4) exists and a real
-# executor (v0.5) sits behind it. Nothing reads this except the executor
-# factory's assertion and the check below. Do not set it true.
+# The transmit boundary. Through v0.5 this had to stay false. v0.6 opens it for
+# real MAVLink flight -- but ONLY in SITL, and the gate is DOUBLED: see
+# ALLOW_REAL_VEHICLE below and the check in _validate(). make_executor() still
+# returns the dry runner whenever this is false.
 ALLOW_VEHICLE_CONTROL: bool = _get_bool("ALLOW_VEHICLE_CONTROL", False)
+
+# --- mission.py (v0.6): real MAVLink flight, SITL only ----------------------
+# The second switch. With ALLOW_VEHICLE_CONTROL true, a MAVLINK_CONNECTION that
+# is not a loopback SITL endpoint (a serial port, a non-loopback address) makes
+# the GSS REFUSE TO START unless ALLOW_REAL_VEHICLE is also true. The purpose is
+# blunt: nobody accidentally flies a real aircraft with this code by editing one
+# line. Real hardware is a deliberate act taken after a human has read the SITL
+# flight logs.
+ALLOW_REAL_VEHICLE: bool = _get_bool("ALLOW_REAL_VEHICLE", False)
+
+# Every state change the executor requests is CONFIRMED from telemetry before it
+# proceeds; each confirmation has a timeout, and a timeout is a FAILURE -- the
+# mission aborts through the normal controlled-return path with a specific
+# reason, never "continue hopefully". Starting points; tune against SITL logs,
+# then real flight logs, and nothing else.
+MAVLINK_CMD_TIMEOUT_S: float = _get_float("MAVLINK_CMD_TIMEOUT_S", 5.0)
+MAVLINK_CMD_RETRIES: int = _get_int("MAVLINK_CMD_RETRIES", 3)
+MODE_CONFIRM_TIMEOUT_S: float = _get_float("MODE_CONFIRM_TIMEOUT_S", 5.0)
+ARM_CONFIRM_TIMEOUT_S: float = _get_float("ARM_CONFIRM_TIMEOUT_S", 10.0)
+TAKEOFF_TIMEOUT_S: float = _get_float("TAKEOFF_TIMEOUT_S", 45.0)
+ALT_TOLERANCE_M: float = _get_float("ALT_TOLERANCE_M", 1.5)
+WAYPOINT_ARRIVAL_M: float = _get_float("WAYPOINT_ARRIVAL_M", 3.0)
+POSITION_TARGET_RATE_HZ: float = _get_float("POSITION_TARGET_RATE_HZ", 2.0)
+# The executor has NO code path that disarms an armed vehicle above this
+# altitude. Cutting motors in flight turns a recoverable situation into a
+# falling object.
+DISARM_MAX_ALT_M: float = _get_float("DISARM_MAX_ALT_M", 0.5)
+MISSION_STEP_TIMEOUT_S: float = _get_float("MISSION_STEP_TIMEOUT_S", 120.0)
+# R2 HOLD (safety.py's lateral-offset check) now actively recomputes the
+# standoff point and repositions instead of idling at the too-close position.
+# If that has not resolved the distance within this many seconds, it is no
+# longer ordinary GPS/arrival noise -- it is a configuration or geometry
+# problem, and holding any longer repeats the real-SITL defect. Escalate to
+# RTL_NOW instead of looping forever.
+R2_ESCAPE_TIMEOUT_S: float = _get_float("R2_ESCAPE_TIMEOUT_S", 15.0)
 
 # --- safety.py (v0.4) ----------------------------------------------------------
 # These live HERE and NOT in the database's system_config table, on purpose:
@@ -180,6 +238,18 @@ BATTERY_MAX_AGE_S: float = _get_float("BATTERY_MAX_AGE_S", 5.0)
 GPS_MAX_AGE_S: float = _get_float("GPS_MAX_AGE_S", 5.0)
 BATTERY_CELLS: int = _get_int("BATTERY_CELLS", 6)
 BATTERY_CELL_FLOOR_V: float = _get_float("BATTERY_CELL_FLOOR_V", 3.2)
+# The real-SITL pass found BATTERY_CELLS defaulted to 6 against a real 3S
+# pack: the per-cell floor computed 2.1V/cell against BATTERY_CELL_FLOOR_V and
+# fired CRITICAL on a fully healthy, fully charged, disarmed aircraft before
+# any fault existed. A checklist item is not sufficient -- it depends on a
+# human remembering, on every deployment, forever. These two feed a runtime
+# startup sanity check (safety.py's check_battery_cell_configuration): the
+# implied cell count from a settled, disarmed voltage reading is compared
+# against BATTERY_CELLS once per power-up, and a mismatch beyond
+# BATTERY_CELL_MISMATCH_TOLERANCE cells' worth of voltage is a CONFIGURATION
+# FAULT that hard-blocks every flight command -- not a soft warning.
+NOMINAL_CELL_RESTING_V: float = _get_float("NOMINAL_CELL_RESTING_V", 3.85)
+BATTERY_CELL_MISMATCH_TOLERANCE: float = _get_float("BATTERY_CELL_MISMATCH_TOLERANCE", 0.5)
 BATTERY_LAUNCH_MIN_PCT: float = _get_float("BATTERY_LAUNCH_MIN_PCT", 50.0)
 RTL_RESERVE_PCT: float = _get_float("RTL_RESERVE_PCT", 20.0)
 CRUISE_SPEED_MS: float = _get_float("CRUISE_SPEED_MS", 10.0)
@@ -296,6 +366,8 @@ def _validate() -> None:
 
     if LATERAL_OFFSET_M < 0:
         errors.append(f"LATERAL_OFFSET_M must not be negative, got {LATERAL_OFFSET_M}")
+    if STANDOFF_MARGIN_M < 0:
+        errors.append(f"STANDOFF_MARGIN_M must not be negative, got {STANDOFF_MARGIN_M}")
 
     for name, value in (
         ("CRUISE_ALT_INBOUND", CRUISE_ALT_INBOUND),
@@ -439,6 +511,16 @@ def _validate() -> None:
             f"BATTERY_CELL_FLOOR_V ({BATTERY_CELL_FLOOR_V}) is outside a sane "
             f"Li-ion range [2.5, 4.2]"
         )
+    if not 3.0 <= NOMINAL_CELL_RESTING_V <= 4.2:
+        errors.append(
+            f"NOMINAL_CELL_RESTING_V ({NOMINAL_CELL_RESTING_V}) is outside a sane "
+            f"resting Li-ion range [3.0, 4.2]"
+        )
+    if BATTERY_CELL_MISMATCH_TOLERANCE <= 0:
+        errors.append(
+            f"BATTERY_CELL_MISMATCH_TOLERANCE must be positive, got "
+            f"{BATTERY_CELL_MISMATCH_TOLERANCE}"
+        )
     for name, value in (
         ("BATTERY_LAUNCH_MIN_PCT", BATTERY_LAUNCH_MIN_PCT),
         ("RTL_RESERVE_PCT", RTL_RESERVE_PCT),
@@ -541,13 +623,45 @@ def _validate() -> None:
         if not {"name", "lat", "lon"} <= set(_spot):
             errors.append(f"SAFE_SPOTS_FALLBACK row missing name/lat/lon: {_spot}")
 
-    if ALLOW_VEHICLE_CONTROL:
-        # Hard stop. There is no vehicle-control executor before v0.5, and no
-        # safety.py before v0.4. A future version relaxes this line; until
-        # then the GSS must not start with this flag set.
+    # --- mission.py (v0.6) ---
+    for name, value in (
+        ("MAVLINK_CMD_TIMEOUT_S", MAVLINK_CMD_TIMEOUT_S),
+        ("MODE_CONFIRM_TIMEOUT_S", MODE_CONFIRM_TIMEOUT_S),
+        ("ARM_CONFIRM_TIMEOUT_S", ARM_CONFIRM_TIMEOUT_S),
+        ("TAKEOFF_TIMEOUT_S", TAKEOFF_TIMEOUT_S),
+        ("ALT_TOLERANCE_M", ALT_TOLERANCE_M),
+        ("WAYPOINT_ARRIVAL_M", WAYPOINT_ARRIVAL_M),
+        ("POSITION_TARGET_RATE_HZ", POSITION_TARGET_RATE_HZ),
+        ("DISARM_MAX_ALT_M", DISARM_MAX_ALT_M),
+        ("MISSION_STEP_TIMEOUT_S", MISSION_STEP_TIMEOUT_S),
+        ("R2_ESCAPE_TIMEOUT_S", R2_ESCAPE_TIMEOUT_S),
+    ):
+        if value <= 0:
+            errors.append(f"{name} must be positive, got {value}")
+    if MAVLINK_CMD_RETRIES < 0:
+        errors.append(f"MAVLINK_CMD_RETRIES must not be negative, got {MAVLINK_CMD_RETRIES}")
+    if DISARM_MAX_ALT_M > 2.0:
         errors.append(
-            "ALLOW_VEHICLE_CONTROL must be false: safety.py (v0.4) and a real "
-            "executor (v0.5) do not exist yet. The GSS is dry-run only."
+            f"DISARM_MAX_ALT_M ({DISARM_MAX_ALT_M}) is dangerously high -- a disarm "
+            f"is only safe within ~0.5 m of the ground"
+        )
+    if CRUISE_ALT_OUTBOUND <= ON_STATION_ALT or CRUISE_ALT_INBOUND <= ON_STATION_ALT:
+        errors.append(
+            f"CRUISE_ALT_OUTBOUND ({CRUISE_ALT_OUTBOUND}) and CRUISE_ALT_INBOUND "
+            f"({CRUISE_ALT_INBOUND}) must both be above ON_STATION_ALT ({ON_STATION_ALT})"
+        )
+
+    # --- the doubled transmit gate (v0.6) ---
+    if (
+        ALLOW_VEHICLE_CONTROL
+        and not _is_loopback_sitl(MAVLINK_CONNECTION)
+        and not ALLOW_REAL_VEHICLE
+    ):
+        errors.append(
+            f"ALLOW_VEHICLE_CONTROL is true and MAVLINK_CONNECTION "
+            f"({MAVLINK_CONNECTION!r}) is not a loopback SITL endpoint. To fly a "
+            f"real aircraft with this code, set ALLOW_REAL_VEHICLE=true -- "
+            f"deliberately, after reading the SITL flight logs. Refusing to start."
         )
 
     if errors:

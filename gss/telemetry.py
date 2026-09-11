@@ -47,6 +47,14 @@ _GPS_FIX_3D = mavutil.mavlink.GPS_FIX_TYPE_3D_FIX  # 3
 # this list; link.py just transmits the requests.
 _MSG_WIND = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_WIND", 168)
 _MSG_VIBRATION = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_VIBRATION", 241)
+_MSG_EKF_STATUS = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_EKF_STATUS_REPORT", 193)
+
+# EKF_STATUS_FLAGS bits (defaults match the ArduPilot dialect).
+_EKF_ATTITUDE = getattr(mavutil.mavlink, "EKF_ATTITUDE", 1)
+_EKF_VELOCITY_HORIZ = getattr(mavutil.mavlink, "EKF_VELOCITY_HORIZ", 2)
+_EKF_POS_HORIZ_ABS = getattr(mavutil.mavlink, "EKF_POS_HORIZ_ABS", 8)
+_EKF_CONST_POS_MODE = getattr(mavutil.mavlink, "EKF_CONST_POS_MODE", 16)
+_PREARM_FRESH_S = 6.0  # a "PreArm:" complaint older than this is treated as cleared
 
 _STREAM_PLAN: tuple[tuple[str, int, float], ...] = (
     ("GLOBAL_POSITION_INT", mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, config.STREAM_RATE_POSITION_HZ),
@@ -58,6 +66,9 @@ _STREAM_PLAN: tuple[tuple[str, int, float], ...] = (
     # estimate; VIBRATION carries accel vibration levels + clipping counts.
     ("WIND", _MSG_WIND, config.STREAM_RATE_STATUS_HZ),
     ("VIBRATION", _MSG_VIBRATION, config.STREAM_RATE_STATUS_HZ),
+    # v0.6: the arming-gate signals. EKF health, and (via STATUSTEXT, which is
+    # unsolicited) ArduPilot's own pre-arm complaints.
+    ("EKF_STATUS_REPORT", _MSG_EKF_STATUS, config.STREAM_RATE_STATUS_HZ),
 )
 
 # Legacy fallback: (stream group, rate) covering the same messages. WIND and
@@ -103,6 +114,13 @@ class TelemetryReader:
         self._gps_satellites: int | None = None
         self._gps_hdop: float | None = None
 
+        # v0.6 arming-gate signals
+        self._ekf_healthy: bool | None = None
+        self._home_set: bool | None = None
+        self._prearm_fail_text: str | None = None
+        self._ekf_at: datetime | None = None
+        self._prearm_at: datetime | None = None
+
         # v0.5 observed conditions
         self._wind_speed_ms: float | None = None
         self._wind_direction_deg: float | None = None
@@ -131,17 +149,36 @@ class TelemetryReader:
 
         link.register_message_callback(self._on_message)
         link.register_on_connect(self._request_streams)
+        # HOME_POSITION only ever arrives once, on request (real ArduPilot
+        # never re-broadcasts it to a GCS that connects after the home was
+        # already set -- found against real SITL, v0.6): register it with the
+        # watchdog too, or a GSS that (re)connects to an already-running
+        # vehicle stays stuck at home_set=None forever even though every
+        # other stream is flowing perfectly healthily.
+        link.register_watchdog_check("home position", lambda: self._home_set is not True)
 
     # --- stream requests (decides what to ask for; link.py transmits) ------
 
     def _request_streams(self, link: MavlinkLink) -> None:
-        """on-connect callback: ask the vehicle to stream the messages we map.
+        """on-connect callback: ask the vehicle to stream the messages we map,
+        and (independently of the streams below) ask for HOME_POSITION once.
 
         Runs on link's connect-worker thread, never the RX thread, so it may
         block briefly waiting for command ACKs. Tries
         MAV_CMD_SET_MESSAGE_INTERVAL first; if the vehicle does not accept
         every request, also sends the legacy REQUEST_DATA_STREAM groups.
+
+        HOME_POSITION is a REQUEST, not a flight command (same "ask the
+        vehicle to report something" category as the stream requests below --
+        R11's amended boundary) -- sent unconditionally here, ahead of the
+        stream-interval branching, since it has nothing to do with which
+        stream path the vehicle accepts. Found needed against real SITL
+        (v0.6): ArduPilot never re-broadcasts its home position to a GCS that
+        merely connects after the home was already set, so a GSS that
+        (re)connects to an already-running vehicle -- the restart-recovery
+        case -- would otherwise never see ``home_set`` become True.
         """
+        link.request_home_position()
         accepted = 0
         for name, message_id, rate_hz in _STREAM_PLAN:
             # 2s per ACK: the requests are serialised (one MAV_CMD id, one ACK
@@ -267,6 +304,29 @@ class TelemetryReader:
                 # "from" bearing is the opposite direction.
                 self._wind_direction_deg = math.degrees(math.atan2(-wy, -wx)) % 360.0
 
+        elif message_type == "EKF_STATUS_REPORT":
+            flags = int(getattr(message, "flags", 0))
+            healthy = (
+                bool(flags & _EKF_ATTITUDE)
+                and bool(flags & _EKF_VELOCITY_HORIZ)
+                and bool(flags & _EKF_POS_HORIZ_ABS)
+                and not (flags & _EKF_CONST_POS_MODE)
+            )
+            with self._lock:
+                self._ekf_at = now
+                self._ekf_healthy = healthy
+
+        elif message_type == "HOME_POSITION":
+            with self._lock:
+                self._home_set = True
+
+        elif message_type == "STATUSTEXT":
+            text = str(getattr(message, "text", "") or "").strip()
+            if text.lower().startswith("prearm"):
+                with self._lock:
+                    self._prearm_at = now
+                    self._prearm_fail_text = text
+
         elif message_type == "VIBRATION":
             with self._lock:
                 self._vibration_at = now
@@ -347,6 +407,19 @@ class TelemetryReader:
                 vibration_clip_z=self._vibration_clip_z,
                 wind_age_s=_age(self._wind_at),
                 vibration_age_s=_age(self._vibration_at),
+                ekf_healthy=(
+                    self._ekf_healthy
+                    if (_age(self._ekf_at) is not None
+                        and _age(self._ekf_at) <= config.GPS_MAX_AGE_S)
+                    else None
+                ),
+                home_set=self._home_set,
+                prearm_fail_text=(
+                    self._prearm_fail_text
+                    if (_age(self._prearm_at) is not None
+                        and _age(self._prearm_at) <= _PREARM_FRESH_S)
+                    else None
+                ),
             )
 
 

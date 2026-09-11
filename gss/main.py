@@ -22,12 +22,20 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 
 from gss import __version__, config
 from gss.link import MavlinkLink
 from gss.telemetry import TelemetryReader, format_console_line
 
 log = logging.getLogger("gss.main")
+
+# How long to wait, after the link connects, for basic telemetry (armed state,
+# relative altitude) to arrive before running the v0.6 airborne-recovery check.
+# HEARTBEAT (armed/mode) is unconditional; altitude needs the stream request
+# to have landed -- this is a bound on that, not a hard requirement (if it
+# times out, recovery runs on whatever it has and says so).
+_RECOVERY_TELEMETRY_GRACE_S = 5.0
 
 
 def _configure_logging() -> None:
@@ -46,7 +54,7 @@ def run() -> int:
 
     link = MavlinkLink()
     reader = TelemetryReader(link)
-    store = _make_store(reader)
+    store = None
     safe_spots = None
     safety = None
     weather = None
@@ -54,14 +62,19 @@ def run() -> int:
     shutdown = threading.Event()
 
     try:
+        store = _make_store(reader)
+
         # The safe-spot book: the list safety.py diverts to when home is not
         # reachable. Never None -- config.SAFE_SPOTS_FALLBACK guarantees a
-        # non-empty list even with no database and no cache.
+        # non-empty list even with no database and no cache. Constructing it
+        # touches no network; only the background thread started below does.
         safe_spots = _make_safe_spots(store)
         safe_spots.start()
 
         # Safety is a HARD start-up requirement -- see _make_safety. If it
-        # cannot be built or started, the GSS does not run.
+        # cannot be built or started, the GSS does not run. This is checked
+        # before the link is even asked to connect, so a construction failure
+        # exits fast and touches no network.
         safety = _make_safety(reader, store, safe_spots)
         try:
             safety.start()
@@ -73,23 +86,45 @@ def run() -> int:
             )
             return 3
 
+        # v0.6: NOW connect -- and before Supabase sync, weather, or command
+        # intake starts a single thread, check whether there is an aircraft in
+        # the sky that this process did not launch. Recovering it outranks
+        # every other startup concern.
+        if link.connect(timeout_s=10.0):
+            log.info("Initial telemetry link established.")
+        else:
+            log.warning(
+                "No link yet; the startup recovery/failsafe checks are skipped "
+                "this run (nothing to check with no vehicle). The background "
+                "thread keeps retrying."
+            )
+
+        adopted_detail = None
+        if link.is_connected:
+            _await_basic_telemetry(reader, _RECOVERY_TELEMETRY_GRACE_S)
+            from gss import mission
+
+            adopted_detail = mission.recover_airborne_vehicle(link, reader.get_snapshot)
+            try:
+                mission.audit_failsafe_params(link)
+            except Exception:
+                log.exception(
+                    "failsafe parameter audit failed; continuing "
+                    "(ArduPilot's own failsafes are unverified this run)"
+                )
+
+        if store is not None and adopted_detail is not None:
+            store.log_event(None, "vehicle_adopted", detail=adopted_detail, sync=True)
+
         weather = _make_weather(reader, store)
         if weather is not None:
             weather.start()
 
-        intake = _make_intake(store, reader, safety, weather)
+        intake = _make_intake(store, reader, safety, weather, link, adopted_detail)
         if store is not None:
             store.start()
         if intake is not None:
             intake.start()
-
-        # Give the link a short grace period so the first console line is
-        # usually populated, but never block the telemetry loop on it -- the
-        # background thread reconnects forever regardless.
-        if link.connect(timeout_s=10.0):
-            log.info("Initial telemetry link established.")
-        else:
-            log.warning("No link yet; printing status and retrying in the background.")
 
         while not shutdown.is_set():
             print(format_console_line(reader.get_snapshot()), flush=True)
@@ -115,6 +150,19 @@ def run() -> int:
         link.close()
         log.info("GSS stopped.")
     return 0
+
+
+def _await_basic_telemetry(reader: TelemetryReader, timeout_s: float) -> None:
+    """Best-effort wait for armed-state + relative-altitude to populate, so the
+    v0.6 startup recovery check has something to look at. Never raises; a
+    caller that still sees ``None`` fields treats that as "unknown" (fail
+    safe), it does not skip the check."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        snap = reader.get_snapshot()
+        if snap.armed is not None and snap.alt_m_relative is not None:
+            return
+        time.sleep(0.2)
 
 
 def _make_safe_spots(store):
@@ -202,11 +250,16 @@ def _make_store(reader: TelemetryReader):
         return None
 
 
-def _make_intake(store, reader: TelemetryReader, safety, weather):
+def _make_intake(store, reader: TelemetryReader, safety, weather, link=None,
+                  adopted_detail: dict | None = None):
     """Build the command intake, or None. Requires the store (Supabase).
 
     A construction failure is logged and downgraded to None -- the GSS still
-    flies the drone and prints to the console (R10).
+    flies the drone and prints to the console (R10). ``link`` is passed through
+    so an accepted flight command can build a real MavlinkExecutor (v0.6);
+    ``adopted_detail`` (from the startup recovery check, run before this
+    function) tells the orphan-mission reconciliation the truth about a vehicle
+    found airborne, instead of a generic "orphaned" message.
     """
     if store is None:
         if config.SUPABASE_ENABLED:
@@ -218,7 +271,8 @@ def _make_intake(store, reader: TelemetryReader, safety, weather):
         from gss.commands import CommandIntake
 
         return CommandIntake(
-            store, reader.get_snapshot, safety=safety, weather=weather
+            store, reader.get_snapshot, safety=safety, weather=weather,
+            link=link, adopted_detail=adopted_detail,
         )
     except Exception:
         log.exception("Could not initialise command intake; continuing without it")

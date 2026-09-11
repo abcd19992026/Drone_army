@@ -79,10 +79,11 @@ def test_normal_streaming_and_guards() -> None:
         _check("Fix1: position + gps mapped",
                round(snap.lat, 4) == 25.5932 and snap.gps_fix_type == 3 and snap.gps_satellites == 12)
         _check("Fix3: position_valid True (coords + 3D fix)", snap.position_valid is True)
-        # v0.5 added WIND (168) and VIBRATION (241) to the stream plan.
-        _wait(lambda: len(fv.requested_message_ids) == 7, 5)
-        _check("Fix1: all 7 stream-plan messages requested via SET_MESSAGE_INTERVAL",
-               fv.requested_message_ids == {1, 24, 33, 74, 147, 168, 241},
+        # v0.5 added WIND (168) and VIBRATION (241); v0.6 added
+        # EKF_STATUS_REPORT (193) to the stream plan.
+        _wait(lambda: len(fv.requested_message_ids) == 8, 5)
+        _check("Fix1: all 8 stream-plan messages requested via SET_MESSAGE_INTERVAL",
+               fv.requested_message_ids == {1, 24, 33, 74, 147, 168, 193, 241},
                str(sorted(fv.requested_message_ids)))
         # The modern path is the primary one for all 7 (whether every ACK
         # lands in time or one slips to the legacy fallback under load -- the

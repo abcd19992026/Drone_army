@@ -188,6 +188,11 @@ class SafetyVerdict:
     # coordinates, and why home was out of reach, with the numbers. ``None``
     # for every other verdict.
     divert_target: dict | None = None
+    # For a HOLD: which check ordered it ("lateral_offset" for R2, ``None``
+    # for every other HOLD cause, e.g. GPS untrustworthy). The executor uses
+    # this to run the R2-specific recompute-and-reposition response instead of
+    # the generic idle-in-place HOLD (real-SITL finding, v0.6.1).
+    hold_kind: str | None = None
 
     def is_veto(self) -> bool:
         """True when this verdict forbids or interrupts flight."""
@@ -366,6 +371,48 @@ def check_battery(snapshot: TelemetrySnapshot) -> list[_Finding]:
             )
         )
     return out
+
+
+def check_battery_cell_configuration(
+    voltage_v: float, configured_cells: int
+) -> str | None:
+    """Startup-only sanity check: does the pack's settled, disarmed resting
+    voltage plausibly match ``configured_cells``? Returns a CRITICAL reason
+    naming both numbers on a mismatch, or ``None`` when it looks right.
+
+    This is a CONFIGURATION check, not a flight condition -- the caller
+    (:class:`SafetyMonitor`) runs it exactly ONCE, at startup, against a
+    settled disarmed reading, never per-tick and never under load. It exists
+    because the real-SITL pass found ``BATTERY_CELLS`` defaulted to 6 against
+    a real 3S pack: :func:`check_battery`'s per-cell floor computed
+    2.1V/cell against ``BATTERY_CELL_FLOOR_V`` and fired CRITICAL on a fully
+    healthy, fully charged, disarmed aircraft before any fault existed. Get it
+    wrong the other way (too few configured cells) and a genuinely critical
+    pack reads as healthy -- worse, because nothing fires at all. A checklist
+    item is not sufficient; it depends on a human remembering, on every
+    deployment, forever.
+
+    The comparison is done in volts (configured-cells-implied voltage vs.
+    measured), not by rounding the measured voltage to the nearest cell count
+    -- a naive round would false-positive on an ordinarily sagged pack sitting
+    near a cell-count boundary.
+    """
+    expected_v = configured_cells * config.NOMINAL_CELL_RESTING_V
+    tolerance_v = config.BATTERY_CELL_MISMATCH_TOLERANCE * config.NOMINAL_CELL_RESTING_V
+    if abs(voltage_v - expected_v) <= tolerance_v:
+        return None
+    implied_cells = max(1, round(voltage_v / config.NOMINAL_CELL_RESTING_V))
+    return (
+        f"BATTERY_CELLS is configured as {configured_cells} (expects a resting "
+        f"voltage of ~{expected_v:.1f}V), but the measured disarmed pack "
+        f"voltage is {voltage_v:.1f}V -- consistent with {implied_cells} "
+        f"cell(s) (~{implied_cells * config.NOMINAL_CELL_RESTING_V:.1f}V). "
+        f"This is a CONFIGURATION FAULT, not a flight condition: "
+        f"BATTERY_CELLS must match the battery actually connected, in either "
+        f"direction -- too high grounds a healthy aircraft forever, too low "
+        f"masks a genuinely critical pack as healthy. Refusing every flight "
+        f"command until this is corrected and the GSS is restarted."
+    )
 
 
 def check_link(snapshot: TelemetrySnapshot, link_down_s: float) -> list[_Finding]:
@@ -574,7 +621,14 @@ def check_lateral_offset(
                 SafetySeverity.CRITICAL,
                 f"{dist:.0f} m from the reported human position -- inside the "
                 f"{config.LATERAL_OFFSET_M:.0f} m lateral offset (R2); "
-                f"hold and open the distance",
+                f"recomputing the standoff point and repositioning to open "
+                f"the distance",
+                # Tagged so the executor can tell this HOLD apart from every
+                # other cause (GPS untrustworthy, etc.) and run the R2-specific
+                # recompute-and-reposition response instead of idling in
+                # place -- see SafetyVerdict.hold_kind and
+                # MavlinkExecutor._resolve_r2_hold (real-SITL finding, v0.6.1).
+                {"kind": "lateral_offset"},
             )
         ]
     return []
@@ -1083,6 +1137,17 @@ def evaluate(
                 f"on the ground and disarmed (R13)"
             )
 
+    hold_kind = None
+    if action == SafetyAction.HOLD:
+        hold_kind = next(
+            (
+                f.data.get("kind")
+                for f in findings
+                if f.action == SafetyAction.HOLD and f.data and f.data.get("kind")
+            ),
+            None,
+        )
+
     return SafetyVerdict(
         action=action,
         severity=severity,
@@ -1091,6 +1156,7 @@ def evaluate(
         latched=new_latch is not None,
         latch_action=new_latch,
         divert_target=divert_target,
+        hold_kind=hold_kind,
     )
 
 
@@ -1152,6 +1218,12 @@ class _LoopState:
     gps_bad_since: float | None = None
     link_down_since: float | None = None
     samples: deque = field(default_factory=deque)
+    # The battery-cell-configuration check runs at most ONCE per process
+    # lifetime (see check_battery_cell_configuration): cell_check_done latches
+    # true the first time a settled, disarmed voltage reading lets it run, and
+    # cell_mismatch_reason then holds the fault (or stays None) for good.
+    cell_check_done: bool = False
+    cell_mismatch_reason: str | None = None
 
 
 class SafetyMonitor:
@@ -1248,6 +1320,15 @@ class SafetyMonitor:
             return verdict
         return SafetyVerdict(SafetyAction.ALLOW, SafetySeverity.NOMINAL, (), now)
 
+    @property
+    def battery_cell_fault(self) -> str | None:
+        """The battery-cell-configuration fault (see
+        :func:`check_battery_cell_configuration`), or ``None`` if the check
+        has not yet run or found no mismatch. Once set, it never clears
+        itself -- a configuration fault does not fix itself mid-process."""
+        with self._lock:
+            return self._state.cell_mismatch_reason
+
     def evaluate_command(
         self, command: dict, *, now: datetime | None = None, mission_active: bool = False
     ) -> SafetyVerdict:
@@ -1256,6 +1337,18 @@ class SafetyMonitor:
         This is the FINAL authority. The intake validation in commands.py is a
         first filter, not a substitute -- nobody may delete either.
         """
+        now = now or datetime.now(timezone.utc)
+        cell_fault = self.battery_cell_fault
+        if cell_fault:
+            # A configuration fault, not a flight condition -- outranks
+            # everything else pre-flight and does not depend on the current
+            # snapshot at all. See check_battery_cell_configuration.
+            return SafetyVerdict(
+                action=SafetyAction.REJECT,
+                severity=SafetySeverity.CRITICAL,
+                reasons=(cell_fault,),
+                checked_at=now,
+            )
         snapshot = self._snapshot_source()
         context = SafetyContext(
             preflight=True,
@@ -1269,7 +1362,7 @@ class SafetyMonitor:
             human_lon=_num(_param(command, "human_lon")),
             mission_active=mission_active,
         )
-        return evaluate(snapshot, context, now=now or datetime.now(timezone.utc))
+        return evaluate(snapshot, context, now=now)
 
     # ---------------------------------------------------------------- loop
 
@@ -1313,6 +1406,39 @@ class SafetyMonitor:
             link_down_s = (
                 0.0 if state.link_down_since is None else mono - state.link_down_since
             )
+
+            # Battery-cell configuration: ONCE per process lifetime, on a
+            # settled disarmed reading -- never per-tick, never under load
+            # (see check_battery_cell_configuration's docstring and the
+            # config.py NOMINAL_CELL_RESTING_V / BATTERY_CELL_MISMATCH_TOLERANCE
+            # comments). A disarmed vehicle with a fresh voltage reading is as
+            # settled as this shell can tell without a dedicated timer, and
+            # "once, ever" means a brief bounce back to armed=True right after
+            # startup cannot cause a second, different reading to be checked.
+            if (
+                not state.cell_check_done
+                and snapshot.armed is False
+                and snapshot.battery_voltage_v is not None
+                and (
+                    snapshot.battery_age_s is None
+                    or snapshot.battery_age_s <= config.BATTERY_MAX_AGE_S
+                )
+            ):
+                state.cell_check_done = True
+                state.cell_mismatch_reason = check_battery_cell_configuration(
+                    snapshot.battery_voltage_v, config.BATTERY_CELLS
+                )
+                if state.cell_mismatch_reason:
+                    log.critical(
+                        "safety: BATTERY CELL CONFIGURATION FAULT -- %s",
+                        state.cell_mismatch_reason,
+                    )
+                else:
+                    log.info(
+                        "safety: battery cell configuration check passed "
+                        "(%.1fV against BATTERY_CELLS=%d)",
+                        snapshot.battery_voltage_v, config.BATTERY_CELLS,
+                    )
 
             prior_latch = state.latch
 

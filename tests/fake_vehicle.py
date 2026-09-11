@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import socket
 import struct
 import threading
@@ -52,6 +53,7 @@ _MSG_BATTERY_STATUS = mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS
 _MSG_GPS_RAW_INT = mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT
 _MSG_WIND = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_WIND", 168)
 _MSG_VIBRATION = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_VIBRATION", 241)
+_MSG_EKF_STATUS = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_EKF_STATUS_REPORT", 193)
 _STREAMABLE = (
     _MSG_GLOBAL_POSITION_INT,
     _MSG_VFR_HUD,
@@ -60,7 +62,66 @@ _STREAMABLE = (
     _MSG_GPS_RAW_INT,
     _MSG_WIND,
     _MSG_VIBRATION,
+    _MSG_EKF_STATUS,
 )
+
+# --- v0.6 flight simulation -------------------------------------------------
+# A kinematic (not physics) simulator: mode changes, arming, takeoff, GUIDED
+# position targets, RTL and LAND all move the vehicle and report back through
+# ordinary telemetry, so gss/mission.py can be exercised end-to-end without
+# real ArduPilot SITL. Off by default (``enable_flight_sim()``) -- every
+# existing test that never calls it sees byte-for-byte the same fake vehicle
+# as before.
+_CMD_SET_MODE = mavutil.mavlink.MAV_CMD_DO_SET_MODE
+_CMD_ARM = mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+_CMD_TAKEOFF = mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+_CMD_GET_HOME_POSITION = mavutil.mavlink.MAV_CMD_GET_HOME_POSITION
+_MODE_GUIDED, _MODE_LOITER, _MODE_RTL, _MODE_LAND, _MODE_BRAKE = 4, 5, 6, 9, 17
+_EARTH_RADIUS_M = 6_371_000.0
+_SIM_CLIMB_MS = 3.0
+_SIM_DESCEND_MS = 1.5
+_SIM_GROUND_SPEED_MS = 9.0
+_SIM_LAND_ALT_M = 0.15
+_SIM_ARRIVE_M = 0.3
+_PREARM_RESEND_S = 1.0
+
+
+def _sim_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return math.degrees(math.atan2(y, x)) % 360.0
+
+
+def _sim_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * _EARTH_RADIUS_M * math.asin(math.sqrt(a))
+
+
+def _sim_step_toward(lat: float, lon: float, tlat: float, tlon: float, step_m: float):
+    dist = _sim_distance_m(lat, lon, tlat, tlon)
+    if step_m <= 0 or dist <= step_m or dist < 1e-9:
+        return tlat, tlon
+    brg = math.radians(_sim_bearing_deg(lat, lon, tlat, tlon))
+    d = step_m / _EARTH_RADIUS_M
+    p1, l1 = math.radians(lat), math.radians(lon)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(brg))
+    l2 = l1 + math.atan2(
+        math.sin(brg) * math.sin(d) * math.cos(p1), math.cos(d) - math.sin(p1) * math.sin(p2)
+    )
+    return math.degrees(p2), (math.degrees(l2) + 540.0) % 360.0 - 180.0
+
+
+def _param_id_str(value: Any) -> str:
+    """PARAM_REQUEST_READ's param_id arrives as either bytes or str, always
+    null-padded to 16 chars. Normalise to a clean ASCII name."""
+    if isinstance(value, bytes):
+        return value.split(b"\x00", 1)[0].decode("ascii", "replace")
+    return str(value).split("\x00", 1)[0]
 
 
 class FakeVehicle:
@@ -123,6 +184,30 @@ class FakeVehicle:
         self._climb_ms = 0.0
         self._vib = (0.0, 0.0, 0.0)
         self._clip = (0, 0, 0)
+
+        # --- v0.6 flight simulation state (all inert until enable_flight_sim) --
+        self._flight_sim = False
+        self._home: tuple[float, float] | None = None
+        self._pos_target: tuple[float, float, float] | None = None
+        self._arm_result = mavutil.mavlink.MAV_RESULT_ACCEPTED
+        self._mode_change_accept = True
+        self._mode_change_ignored = False
+        self._ekf_healthy = True
+        self._home_set_reported = False
+        self._prearm_text: str | None = None
+        self._last_prearm_send = 0.0
+        self._last_sim_mono = 0.0
+        self._params: dict[str, float] = {
+            "BATT_LOW_VOLT": 19.5, "BATT_FS_LOW_ACT": 2, "FS_GCS_ENABLE": 1,
+            "FENCE_ENABLE": 1, "FENCE_RADIUS": 6000.0, "FENCE_ALT_MAX": 60.0,
+            "RTL_ALT": 4500.0,
+        }
+        self.arm_command_count = 0
+        self.disarm_command_count = 0
+        self.mode_change_requests: list[int] = []
+        self._sim_ground_speed = _SIM_GROUND_SPEED_MS
+        self._sim_climb = _SIM_CLIMB_MS
+        self._sim_descend = _SIM_DESCEND_MS
 
     # ------------------------------------------------------------------ API
 
@@ -251,6 +336,83 @@ class FakeVehicle:
             if clip is not None:
                 self._clip = (int(clip[0]), int(clip[1]), int(clip[2]))
 
+    # ---------------------------------------------------- v0.6 flight sim API
+
+    def enable_flight_sim(self) -> None:
+        """Turn on the kinematic flight simulator: mode changes, arming,
+        takeoff, GUIDED position targets, RTL and LAND all move the vehicle."""
+        with self._lock:
+            self._flight_sim = True
+            if self._home is None:
+                self._home = (self._lat_deg, self._lon_deg)
+            self._ekf_healthy = True
+
+    def set_home(self, lat: float, lon: float) -> None:
+        """Where RTL flies back to, and what HOME_POSITION reports."""
+        with self._lock:
+            self._home = (lat, lon)
+
+    def set_param(self, name: str, value: float) -> None:
+        """Drive a failsafe/fence parameter the audit reads (item 13)."""
+        with self._lock:
+            self._params[name] = float(value)
+
+    def get_param(self, name: str) -> float | None:
+        with self._lock:
+            return self._params.get(name)
+
+    def reject_arm(self, result: int | None = None) -> None:
+        """The next (and every subsequent) arm request is DENIED, like a real
+        ArduPilot pre-arm-check failure. ``result`` defaults to MAV_RESULT_DENIED."""
+        with self._lock:
+            self._arm_result = (
+                result if result is not None else mavutil.mavlink.MAV_RESULT_DENIED
+            )
+
+    def allow_arm(self) -> None:
+        with self._lock:
+            self._arm_result = mavutil.mavlink.MAV_RESULT_ACCEPTED
+
+    def set_mode_change_response(self, accept: bool) -> None:
+        """ACK-level refusal: COMMAND_ACK for DO_SET_MODE comes back DENIED."""
+        with self._lock:
+            self._mode_change_accept = bool(accept)
+
+    def set_mode_change_ignored(self, ignored: bool) -> None:
+        """The ACCEPTED-level lie: COMMAND_ACK says ACCEPTED but the mode in
+        HEARTBEAT never actually changes -- exercises the CONFIRMATION path,
+        not just the ACK path ("never assume a command took effect")."""
+        with self._lock:
+            self._mode_change_ignored = bool(ignored)
+
+    def set_ekf_healthy(self, healthy: bool) -> None:
+        with self._lock:
+            self._ekf_healthy = bool(healthy)
+
+    def set_prearm_fail(self, text: str) -> None:
+        """Start sending an ArduPilot-style 'PreArm: ...' STATUSTEXT."""
+        with self._lock:
+            self._prearm_text = text
+            self._last_prearm_send = 0.0
+
+    def clear_prearm_fail(self) -> None:
+        with self._lock:
+            self._prearm_text = None
+
+    def set_sim_rates(
+        self, *, ground_speed_ms: float | None = None,
+        climb_ms: float | None = None, descend_ms: float | None = None,
+    ) -> None:
+        """Speed up (or slow down) the kinematic simulator -- tests use this to
+        avoid waiting real-world minutes for a multi-km real flight."""
+        with self._lock:
+            if ground_speed_ms is not None:
+                self._sim_ground_speed = float(ground_speed_ms)
+            if climb_ms is not None:
+                self._sim_climb = float(climb_ms)
+            if descend_ms is not None:
+                self._sim_descend = float(descend_ms)
+
     def suppress_message(self, message_id: int) -> None:
         """Stop streaming just this MAVLink message id. HEARTBEAT and every
         other requested stream keep flowing normally."""
@@ -329,6 +491,7 @@ class FakeVehicle:
     def _serve(self, conn: mavutil.mavfile) -> None:
         last_hb = 0.0
         last_stream = 0.0
+        last_sim = time.monotonic()
         had_client = False
         while not self._stop.is_set():
             # honour a forced-disconnect request
@@ -368,6 +531,10 @@ class FakeVehicle:
                     self._handle_incoming(conn, msg)
 
             now = time.monotonic()
+            dt = now - last_sim
+            last_sim = now
+            if self._flight_sim:
+                self._sim_tick(dt)
             if conn.port is not None:
                 if now - last_hb >= self._heartbeat_period:
                     self._send_heartbeat(conn)
@@ -375,6 +542,7 @@ class FakeVehicle:
                 if self.is_streaming and now - last_stream >= self._stream_period:
                     self._send_telemetry(conn)
                     last_stream = now
+                self._send_prearm_statustext(conn)
 
             time.sleep(0.02)
 
@@ -400,6 +568,118 @@ class FakeVehicle:
         elif msg_type == "REQUEST_DATA_STREAM":
             with self._lock:
                 self._stream_all = bool(msg.start_stop)
+        elif msg_type == "COMMAND_LONG" and int(msg.command) == _CMD_SET_MODE:
+            mode_id = int(round(msg.param2))
+            with self._lock:
+                self.mode_change_requests.append(mode_id)
+                accept = self._mode_change_accept
+                if accept and not self._mode_change_ignored:
+                    self._custom_mode = mode_id
+            self._safe_send(conn, lambda: conn.mav.command_ack_send(
+                _CMD_SET_MODE,
+                mavutil.mavlink.MAV_RESULT_ACCEPTED if accept
+                else mavutil.mavlink.MAV_RESULT_DENIED,
+            ))
+        elif msg_type == "COMMAND_LONG" and int(msg.command) == _CMD_ARM:
+            arm = msg.param1 > 0.5
+            with self._lock:
+                if arm:
+                    self.arm_command_count += 1
+                    result = self._arm_result
+                    if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                        self._armed = True
+                else:
+                    self.disarm_command_count += 1
+                    result = mavutil.mavlink.MAV_RESULT_ACCEPTED
+                    self._armed = False
+            self._safe_send(conn, lambda: conn.mav.command_ack_send(_CMD_ARM, result))
+        elif msg_type == "COMMAND_LONG" and int(msg.command) == _CMD_TAKEOFF:
+            alt = float(msg.param7)
+            with self._lock:
+                self._pos_target = (self._lat_deg, self._lon_deg, alt)
+            self._safe_send(conn, lambda: conn.mav.command_ack_send(
+                _CMD_TAKEOFF, mavutil.mavlink.MAV_RESULT_ACCEPTED))
+        elif msg_type == "SET_POSITION_TARGET_GLOBAL_INT":
+            with self._lock:
+                self._pos_target = (msg.lat_int / 1e7, msg.lon_int / 1e7, float(msg.alt))
+        elif msg_type == "PARAM_REQUEST_READ":
+            name = _param_id_str(msg.param_id)
+            with self._lock:
+                value = self._params.get(name)
+            if value is not None:
+                self._safe_send(conn, lambda: conn.mav.param_value_send(
+                    name.encode("ascii")[:16], float(value),
+                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32, 0, 0))
+        elif msg_type == "PARAM_REQUEST_LIST":
+            with self._lock:
+                items = list(self._params.items())
+            for i, (name, value) in enumerate(items):
+                self._safe_send(conn, lambda n=name, v=value, i=i: conn.mav.param_value_send(
+                    n.encode("ascii")[:16], float(v),
+                    mavutil.mavlink.MAV_PARAM_TYPE_REAL32, len(items), i))
+        elif msg_type == "COMMAND_LONG" and int(msg.command) == _CMD_GET_HOME_POSITION:
+            # Real ArduPilot answers this REGARDLESS of any "flight sim" mode
+            # (found against real SITL, v0.6) -- it only ever broadcasts
+            # HOME_POSITION unprompted when its home CHANGES, never to a GCS
+            # that merely connects later, so telemetry.py must ask. Answering
+            # this unconditionally (not gated on self._flight_sim, unlike the
+            # periodic auto-send in _send_telemetry above) is what makes this
+            # double as a regression test for that behaviour on every fake-
+            # vehicle-backed suite, not just the flight-sim ones.
+            with self._lock:
+                if self._home is None:
+                    self._home = (self._lat_deg, self._lon_deg)
+                home = self._home
+            self._safe_send(conn, lambda: conn.mav.home_position_send(
+                int(round(home[0] * 1e7)), int(round(home[1] * 1e7)), 0,
+                0.0, 0.0, 0.0, [1.0, 0.0, 0.0, 0.0], 0.0, 0.0, 0.0))
+            self._safe_send(conn, lambda: conn.mav.command_ack_send(
+                _CMD_GET_HOME_POSITION, mavutil.mavlink.MAV_RESULT_ACCEPTED))
+
+    # -------------------------------------------------------- flight sim tick
+
+    def _sim_tick(self, dt: float) -> None:
+        """Kinematic step: mode changes, arming, takeoff, GUIDED position
+        targets, RTL and LAND all move the vehicle. Not physics -- a straight
+        line at a constant rate -- but enough to exercise mission.py's
+        confirm-every-step state machine end to end."""
+        if dt <= 0 or dt > 2.0:  # a stall (breakpoint, GC pause) -- skip this tick
+            return
+        with self._lock:
+            if not self._armed:
+                return
+            mode = self._custom_mode
+            lat, lon, alt = self._lat_deg, self._lon_deg, self._rel_alt_m
+            home = self._home
+            target = self._pos_target
+            speed, climb, descend = self._sim_ground_speed, self._sim_climb, self._sim_descend
+
+        if mode == _MODE_RTL:
+            hlat, hlon = home if home is not None else (lat, lon)
+            dist = _sim_distance_m(lat, lon, hlat, hlon)
+            if dist > _SIM_ARRIVE_M:
+                lat, lon = _sim_step_toward(lat, lon, hlat, hlon, speed * dt)
+            else:
+                alt = max(0.0, alt - descend * dt)
+        elif mode == _MODE_LAND:
+            alt = max(0.0, alt - descend * dt)
+        elif target is not None:
+            tlat, tlon, talt = target
+            dist = _sim_distance_m(lat, lon, tlat, tlon)
+            if dist > _SIM_ARRIVE_M:
+                lat, lon = _sim_step_toward(lat, lon, tlat, tlon, speed * dt)
+            if alt < talt - 0.05:
+                alt = min(talt, alt + climb * dt)
+            elif alt > talt + 0.05:
+                alt = max(talt, alt - descend * dt)
+
+        newly_landed = alt <= _SIM_LAND_ALT_M and mode in (_MODE_RTL, _MODE_LAND)
+        with self._lock:
+            self._lat_deg, self._lon_deg, self._rel_alt_m = lat, lon, (0.0 if newly_landed else alt)
+            if newly_landed:
+                self._armed = False
+                self._custom_mode = mode  # ArduPilot leaves the mode as-is on disarm
+                self._pos_target = None
 
     # ----------------------------------------------------------- send msgs
 
@@ -471,6 +751,45 @@ class FakeVehicle:
         if self._wants(_MSG_VIBRATION):
             self._safe_send(conn, lambda: mav.vibration_send(
                 now_us, vib[0], vib[1], vib[2], clip[0], clip[1], clip[2]))
+
+        with self._lock:
+            flight_sim = self._flight_sim
+            ekf_healthy = self._ekf_healthy
+            home = self._home
+            home_reported = self._home_set_reported
+        if flight_sim and self._wants(_MSG_EKF_STATUS):
+            flags = 0
+            if ekf_healthy:
+                flags = (
+                    getattr(mavutil.mavlink, "EKF_ATTITUDE", 1)
+                    | getattr(mavutil.mavlink, "EKF_VELOCITY_HORIZ", 2)
+                    | getattr(mavutil.mavlink, "EKF_VELOCITY_VERT", 4)
+                    | getattr(mavutil.mavlink, "EKF_POS_HORIZ_REL", 4)
+                    | getattr(mavutil.mavlink, "EKF_POS_HORIZ_ABS", 8)
+                    | getattr(mavutil.mavlink, "EKF_POS_VERT_ABS", 16)
+                    | getattr(mavutil.mavlink, "EKF_PRED_POS_HORIZ_REL", 128)
+                )
+            self._safe_send(conn, lambda: mav.ekf_status_report_send(
+                flags, 0.1, 0.1, 0.1, 0.1, 0.0))
+        if flight_sim and home is not None:
+            self._safe_send(conn, lambda: mav.home_position_send(
+                int(round(home[0] * 1e7)), int(round(home[1] * 1e7)), 0,
+                0.0, 0.0, 0.0, [1.0, 0.0, 0.0, 0.0], 0.0, 0.0, 0.0))
+            if not home_reported:
+                with self._lock:
+                    self._home_set_reported = True
+
+    def _send_prearm_statustext(self, conn: mavutil.mavfile) -> None:
+        with self._lock:
+            text = self._prearm_text
+            due = self._flight_sim and text and (
+                time.monotonic() - self._last_prearm_send >= _PREARM_RESEND_S
+            )
+            if due:
+                self._last_prearm_send = time.monotonic()
+        if due:
+            self._safe_send(conn, lambda: conn.mav.statustext_send(
+                mavutil.mavlink.MAV_SEVERITY_CRITICAL, text.encode("ascii")[:50]))
 
     def _safe_send(self, conn: mavutil.mavfile, send_fn: Any) -> None:
         try:

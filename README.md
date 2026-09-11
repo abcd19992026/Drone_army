@@ -8,14 +8,49 @@ production; for now it runs on Windows against ArduPilot SITL.
 console; a best-effort Supabase mirror of the telemetry plus a live status
 page (v0.2); command intake -> **dry-run** missions (v0.3); `safety.py`, the
 veto authority (v0.4); `weather.py`, conditions awareness and the
-stay-or-return decision (v0.5). The GSS transmits nothing over MAVLink but
-telemetry stream-rate requests (send boundary at the top of `gss/link.py`,
-rule **R11**); network calls live in `gss/store.py`, `gss/commands.py` and
-`gss/weather_feed.py` and never block the flight path (rule **R10**). It does
-not arm, change mode, take off, or send a waypoint -- missions still walk their
-states on a timer and log what a real flight *would* do, now with safety.py
-able to veto/interrupt and weather.py able to hold, extend, or turn one back. A
-real executor (v0.6) comes next. See `PROJECT.md`.
+stay-or-return decision (v0.5); `mission.py`, the first **real** MAVLink flight
+in SITL (v0.6). `ALLOW_VEHICLE_CONTROL=false` (the default) still runs exactly
+as v0.5 -- transmitting nothing but telemetry stream-rate requests (send
+boundary at the top of `gss/link.py`, rule **R11**). Set it true against a
+loopback SITL endpoint and the GSS will arm, take off, fly, and land for real;
+against anything else (a serial port, a non-loopback address) it also needs
+`ALLOW_REAL_VEHICLE=true` or it refuses to start, by name. Network calls live
+in `gss/store.py`, `gss/commands.py` and `gss/weather_feed.py` and never block
+the flight path (rule **R10**). See `PROJECT.md`.
+
+**mission.py (v0.6):** `MavlinkExecutor`, the real-flight `Executor` behind
+`make_executor()` once `ALLOW_VEHICLE_CONTROL` is true. Every command --
+mode change, arm, takeoff, waypoint -- is sent through **one** chokepoint
+(`gss.link.MavlinkLink.transmit()`, built only from `gss/mission.py`) and then
+**confirmed from telemetry**, never assumed from the ACK; a confirmation
+timeout aborts by the normal path, and arming is never retried after ArduPilot
+rejects it. The flight sequence is GUIDED -> arm -> takeoff to
+`CRUISE_ALT_OUTBOUND` -> fly to the on-station point at that altitude ->
+descend to `ON_STATION_ALT` -> loiter -> climb to `CRUISE_ALT_INBOUND` -> RTL
+-> land (outbound/inbound cruise altitudes differ on purpose). For a summon,
+the on-station point is `LATERAL_OFFSET_M` **downwind** of the person (a power
+loss must not drift the aircraft toward them); with no wind reading it falls
+back to the bearing from the person toward the dock, and it is recomputed --
+repositioning without ending the mission -- as the wind changes (rule **R2**,
+closing a Phase-4 gap where a plain summon's on-station point was never
+actually computed). An abort in the air is **always** a controlled return,
+never a disarm: HOLD holds position, DESCEND stops and comes down to a safe
+altitude, RTL_NOW/an abort command RTL, DIVERT flies to a safe spot and lands,
+LAND_NOW lands where it is -- and a safety.py/weather.py verdict interrupts a
+manoeuvre already in progress rather than waiting for it to finish. No code
+path disarms above `DISARM_MAX_ALT_M`
+(`tests/test_mission.py` greps `gss/mission.py` for one and asserts there is
+none). On startup, before Supabase sync/weather/command-intake start,
+`recover_airborne_vehicle()` checks the vehicle's actual state: armed and above
+`DISARM_MAX_ALT_M` means a previous GSS process is gone but the aircraft is
+still flying -- it logs CRITICAL, adopts it, and orders RTL immediately, before
+touching the database. `audit_failsafe_params()` also runs at startup and
+**reads** (never writes) ArduPilot's own battery/GCS/fence/RTL failsafe
+parameters, reporting any mismatch loudly -- a human fixes them in Mission
+Planner; this code verifies ArduPilot's failsafes, it does not replace them.
+Landing is ArduPilot's own RTL/LAND for now; every landing writes a
+`landing_gps_only` mission_event marking the seam for ArUco precision landing
+(a later phase).
 
 **weather.py (v0.5):** a pure core (conditions in, verdict out -- no I/O, no
 clock reads, no network import) plus `gss/weather_feed.py`, the networked
@@ -78,6 +113,8 @@ gss/
   safe_spots.py   the divert-target list (v0.5.1): DB + disk cache + config fallback (outside R1)
   weather.py      conditions awareness (v0.5): pure classification + stay-or-return
   weather_feed.py the networked forecast fetcher + WeatherMonitor (outside the R1 boundary)
+  mission.py      MavlinkExecutor (v0.6): real flight, confirm-every-step, standoff,
+                  startup recovery of an airborne vehicle, failsafe-parameter audit
   main.py         entry point: wire it together, print a line every 2s
 supabase/
   migrations/     the schema -- the source of truth (apply with the Supabase CLI)
@@ -91,6 +128,7 @@ tests/
   test_commands.py    v0.3 command intake vs the real Supabase project in .env (37)
   test_safety.py      v0.4 safety: pure scenario table + shell + import boundary + live layer
   test_weather.py     v0.5 weather: classification table + decisions + feed + boundary + live layer
+  test_mission.py     v0.6 real flight vs fake_vehicle.py's kinematic flight sim (57)
 ```
 
 ## Setup (Windows)
@@ -218,7 +256,13 @@ The console position label reads `POS ` when the fix is valid (real coordinates
 `tests/fake_vehicle.py` is a stand-in for SITL: a MAVLink server over TCP whose
 battery, position, GPS fix, armed state and mode are all driveable from a test,
 and which can force a clean or an abrupt disconnect. Like real ArduPilot it
-sends **only HEARTBEAT until asked** for streams.
+sends **only HEARTBEAT until asked** for streams. `enable_flight_sim()` (v0.6)
+turns it into a small kinematic simulator: it answers mode changes, arming,
+takeoff and GUIDED position targets, and moves the vehicle toward its target
+at a driveable ground-speed/climb/descend rate -- enough to exercise
+`mission.py`'s confirm-every-step state machine end to end without real
+ArduPilot SITL. `test_mission.py`'s 14 verification items run against this
+simulator; the real SITL/Mission Planner pass is still the user's to run.
 
 Run it as a standalone server (defaults to port **5799**, never 5762):
 
@@ -251,10 +295,15 @@ Run the test suites:
 python -m tests.test_v011_fixes   # MAVLink path, fake vehicle       (18 checks)
 python -m tests.test_store        # store.py vs a local mock HTTP     (24 checks)
 python -m tests.test_commands     # v0.3 intake vs the real project   (37 checks, ~5 min)
+python -m tests.test_safety       # v0.4 safety vs the real project   (94 checks)
+python -m tests.test_weather      # v0.5 weather vs the real project  (88 checks)
+python -m tests.test_mission      # v0.6 real flight, fake_vehicle sim (57 checks, ~2 min)
 ```
 
-`test_commands` needs a reachable Supabase (the `.env` project) and creates /
-deletes rows for `DRONE_ID` as it runs.
+`test_commands`, `test_safety` and `test_weather` need a reachable Supabase
+(the `.env` project), create/delete rows for `DRONE_ID`, and **must be run one
+at a time, never in parallel** -- they share `DRONE_ID` and each wipes the
+others' rows on start. `test_mission` needs no network at all.
 
 ### Demoing the status page with the fake vehicle
 
@@ -275,6 +324,67 @@ fv.set_battery(pct=18, voltage_v=20.1)
 fv.set_position(lat=25.9, lon=85.9, fix_type=1)   # -> page shows "no valid fix", position_valid false
 fv.disconnect_abrupt()                            # -> page STALE banner after 10 s
 ```
+
+## Verifying the acceptance criteria (v0.6)
+
+Run `python -m tests.test_mission` (57 checks, against `fake_vehicle.py`'s
+kinematic flight sim -- **not** real ArduPilot SITL; that pass is still the
+user's to run in Mission Planner). It covers all 14 verification items:
+
+1. a full summon flight lands with the outbound/on-station/inbound altitude
+   profile confirmed at each phase (55/28/45 m in the test's config);
+2. the on-station point is exactly `LATERAL_OFFSET_M` downwind, and moves when
+   the wind flips 180°;
+3. a mode change ArduPilot silently ignores aborts with a specific reason in
+   ~`MODE_CONFIRM_TIMEOUT_S x MAVLINK_CMD_RETRIES`, never forever;
+4. a rejected arm aborts on the ground with exactly one arm command sent, never
+   retried;
+5. battery draining mid-flight fires RTL_NOW **while a goto leg is still in
+   progress** (proven by position samples, not by waiting for the leg to
+   finish) and the vehicle actually turns around;
+6. a link cut past the (shortened, for the test) grace period fires our own
+   RTL_NOW, the link reconnects on its own, and the same mission id -- not a
+   new mission -- is what continues;
+7. an abort command RTLs and disarms only after it is back on the ground; a
+   static grep of `gss/mission.py` proves there is no code path that requests
+   a disarm at all;
+8. **the most important test in this phase**: kill the executor thread
+   mid-flight (simulating a crashed GSS process) and call
+   `recover_airborne_vehicle()` cold -- it finds the still-armed, still-flying
+   vehicle, logs CRITICAL, orders RTL, and the aircraft comes home and lands;
+9. an emergency mission holds station through and well past
+   `WEATHER_WARN_GRACE_S` under MARGINAL weather, proven with real position
+   samples over time, not just the absence of a return event;
+10. SEVERE weather on station during an emergency mission returns anyway, with
+    measured numbers (wind speed) in the event detail, marked not overridable;
+11. a chokepoint test greps every module under `gss/` for a flight-command
+    MAVLink send and confirms only `gss/mission.py` builds one;
+12. `ALLOW_VEHICLE_CONTROL=true` with a serial connection string and
+    `ALLOW_REAL_VEHICLE` unset refuses to start, by name; a loopback SITL
+    endpoint needs no second switch;
+13. a deliberately misconfigured fake vehicle (`FENCE_ENABLE=0`,
+    `FENCE_RADIUS=99999`, `RTL_ALT=0`) makes the failsafe audit report all
+    three mismatches by name, and changes nothing;
+14. all five earlier suites still pass (18+24+37+94+88, run individually).
+
+Two things worth knowing about how the suite gets there:
+
+- Item 5's battery level is chosen so RTL_NOW fires **and** home stays
+  reachable within `RTL_RESERVE_PCT` -- safety.py's separate point-of-no-return
+  escalation to a LAND-in-place (home genuinely unreachable) is real,
+  correct behaviour, and is exercised on its own by items 9/10's low-battery
+  paths, not conflated with this one.
+- Item 6 sets `LINK_LOSS_GRACE_S=0.5` s for the run (production default is
+  30 s): `MavlinkLink`'s reconnect backoff is read from config only right
+  after a connection succeeds, not on every disconnect, so shortening the
+  grace is the reliable way to prove "past the grace period, still
+  disconnected" against a fake vehicle that reconnects in under ~2 s.
+
+`hold` (the Phase-3 command type) is deliberately **not** wired to affect a
+real `MavlinkExecutor` flight in v0.6 -- there is no `resume` command yet to
+release it, and stranding a real mission indefinitely was judged worse than an
+honest log line saying so. Only safety.py's own HOLD verdict reaches the
+executor.
 
 ## Verifying the acceptance criteria (v0.3)
 
