@@ -54,6 +54,9 @@ Thumbs.db
 
 # Web status page -- real config holds the project URL + anon key
 web/config.js
+web/node_modules/
+web/dist/
+*.tsbuildinfo
 
 # Supabase CLI local state
 supabase/.branches/
