@@ -58,6 +58,7 @@ def run() -> int:
     safe_spots = None
     safety = None
     weather = None
+    beacon = None
     intake = None
     scheduler = None
     shutdown = threading.Event()
@@ -121,6 +122,10 @@ def run() -> int:
         if weather is not None:
             weather.start()
 
+        beacon = _make_beacon(reader, store)
+        if beacon is not None:
+            beacon.start()
+
         intake = _make_intake(store, reader, safety, weather, link, adopted_detail)
         if store is not None:
             store.start()
@@ -143,6 +148,9 @@ def run() -> int:
         if intake is not None:
             log.info("Stopping command intake...")
             intake.close(timeout_s=5.0)
+        if beacon is not None:
+            log.info("Stopping beacon monitor...")
+            beacon.close(timeout_s=3.0)
         if weather is not None:
             log.info("Stopping weather monitor...")
             weather.close(timeout_s=3.0)
@@ -237,6 +245,31 @@ def _make_weather(reader: TelemetryReader, store):
         )
     except Exception:
         log.exception("Could not initialise weather awareness; continuing without it")
+        return None
+
+
+def _make_beacon(reader: TelemetryReader, store):
+    """Build the beacon monitor, or None.
+
+    Not a hard requirement (rules R1/R10): with ``BEACON_ENABLED=false`` (or
+    a construction failure) the GSS runs exactly as Phase 11 did -- a lost
+    drone just isn't lit up and sounding, it isn't left unrecoverable; the
+    beacon is a findability aid layered on top, never a substitute for the
+    existing link-loss handling in gss/link.py.
+    """
+    if not config.BEACON_ENABLED:
+        log.info("Find-my-drone beacon disabled (BEACON_ENABLED=false).")
+        return None
+    try:
+        from gss.beacon import BeaconMonitor
+
+        return BeaconMonitor(
+            reader.get_snapshot,
+            store=store,
+            event_sink=(store.log_event if store is not None else None),
+        )
+    except Exception:
+        log.exception("Could not initialise the beacon monitor; continuing without it")
         return None
 
 

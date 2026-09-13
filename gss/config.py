@@ -420,6 +420,32 @@ WABA_ACCESS_TOKEN: str = _get_str("WABA_ACCESS_TOKEN", "")
 # clear 'failed' alerts row, not a guessed request) until it is set.
 WABA_TEMPLATE_NAME: str = _get_str("WABA_TEMPLATE_NAME", "")
 
+# --- gss/beacon.py (Phase 12): find-my-drone beacon -------------------------
+# Spotlight + siren on link loss, purely time-based (see that module's
+# docstring for why -- no fresh telemetry exists to check "actually
+# landed"). BEACON_ENABLED=false means gss/main.py never imports gss.beacon;
+# BEACON_TICK_S is tighter than weather's tick -- this is time-sensitive for
+# a lost drone. PAYLOAD_HARDWARE_ENABLED stays false until real payload
+# hardware exists and RealPayloadActuator (gss/payload.py) is actually wired
+# -- flipping it before then makes every actuator call raise
+# NotImplementedError (caught, logged, never crashes -- R8).
+#
+# The three *_DEFAULT values below are fallbacks only, used when
+# gss.store.get_system_config() can't be reached -- the real, operator-
+# tunable values live in the `system_config` table (keys
+# beacon.link_loss_activate_delay_s / beacon.ground_continuous_s /
+# beacon.periodic_interval_s, seeded by the initial schema migration). They
+# are read ONCE at BeaconMonitor construction, never per-tick (R10).
+# BEACON_PERIODIC_ON_S_DEFAULT has no system_config counterpart -- it is
+# config.py-only.
+BEACON_ENABLED: bool = _get_bool("BEACON_ENABLED", True)
+BEACON_TICK_S: float = _get_float("BEACON_TICK_S", 2.0)
+PAYLOAD_HARDWARE_ENABLED: bool = _get_bool("PAYLOAD_HARDWARE_ENABLED", False)
+BEACON_ACTIVATE_DELAY_S_DEFAULT: float = _get_float("BEACON_ACTIVATE_DELAY_S_DEFAULT", 30.0)
+BEACON_CONTINUOUS_S_DEFAULT: float = _get_float("BEACON_CONTINUOUS_S_DEFAULT", 120.0)
+BEACON_PERIODIC_INTERVAL_S_DEFAULT: float = _get_float("BEACON_PERIODIC_INTERVAL_S_DEFAULT", 300.0)
+BEACON_PERIODIC_ON_S_DEFAULT: float = _get_float("BEACON_PERIODIC_ON_S_DEFAULT", 15.0)
+
 # --- gss/scheduler.py (v0.9): patrol scheduler ------------------------------
 # Recurring flights ("patrol this land every day at 7am"). Its entire
 # vocabulary is: read patrol_schedules, write one row to commands. It never
@@ -744,6 +770,17 @@ def _validate() -> None:
     # --- alerts.py (Phase 11) ---
     if not STATUS_PAGE_BASE_URL:
         errors.append("STATUS_PAGE_BASE_URL must not be empty")
+
+    # --- beacon.py (Phase 12) ---
+    for _name, _value in (
+        ("BEACON_TICK_S", BEACON_TICK_S),
+        ("BEACON_ACTIVATE_DELAY_S_DEFAULT", BEACON_ACTIVATE_DELAY_S_DEFAULT),
+        ("BEACON_CONTINUOUS_S_DEFAULT", BEACON_CONTINUOUS_S_DEFAULT),
+        ("BEACON_PERIODIC_INTERVAL_S_DEFAULT", BEACON_PERIODIC_INTERVAL_S_DEFAULT),
+        ("BEACON_PERIODIC_ON_S_DEFAULT", BEACON_PERIODIC_ON_S_DEFAULT),
+    ):
+        if _value <= 0:
+            errors.append(f"{_name} must be positive, got {_value}")
 
     # --- scheduler.py (v0.9) ---
     for _name, _value in (

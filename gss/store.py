@@ -1001,6 +1001,49 @@ class TelemetryStore:
             resp.read()
         return object_path
 
+    # --------------------------------------------------------- system_config (Phase 12)
+
+    def get_system_config(self, key: str, default: object) -> object:
+        """Generic read of one row from `system_config` (key/value jsonb).
+
+        A general utility, not beacon-specific -- future phases can reuse it
+        for any other runtime-tunable value in that table. R10: any failure
+        (unreachable, missing row, bad JSON) returns ``default`` silently
+        (a logged warning, never an exception) -- this must never be the
+        reason a caller's construction or tick fails.
+        """
+        out = self._sync_call(
+            "GET", "/rest/v1/system_config",
+            {"key": f"eq.{key}", "select": "value", "limit": "1"},
+            None, attempts=3, timeout=6.0, what=f"get_system_config({key})",
+        )
+        if not out.ok:
+            log.warning(
+                "store: get_system_config(%r) unreachable; using default %r", key, default,
+            )
+            return default
+        try:
+            rows = json.loads(out.body)
+        except (json.JSONDecodeError, TypeError):
+            log.warning(
+                "store: get_system_config(%r) returned junk: %r; using default %r",
+                key, out.body[:200], default,
+            )
+            return default
+        if not rows:
+            log.warning(
+                "store: get_system_config(%r) found no row; using default %r", key, default,
+            )
+            return default
+        try:
+            return rows[0]["value"]
+        except (KeyError, TypeError):
+            log.warning(
+                "store: get_system_config(%r) row missing 'value'; using default %r",
+                key, default,
+            )
+            return default
+
     def update_drone(self, **fields: object) -> bool:
         """PATCH the drones row for this drone. Used by media.py's scanner
         (via the supervisor) to toggle recording_active and by future phases.
