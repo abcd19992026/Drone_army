@@ -36,6 +36,13 @@ Mirrors the pure/shell split used by weather.py and scheduler.py:
 R8/R10: a tick never raises, whether the fault is an unreachable store, a
 missing system_config row, or (rule check, item 9) a real payload driver
 that isn't wired yet raising out of the actuator.
+
+Phase 13 adds a MANUAL override (the phone's "find_my_drone" command,
+handled in gss/commands.py's ``_handle_find_my_drone``): a
+:class:`BeaconPhase` value that forces the beacon on regardless of link
+status, for a configurable duration, via :meth:`BeaconMonitor.trigger_manual`.
+gss/commands.py routes through this ONE monitor instance rather than driving
+the payload actuator directly -- there must be exactly one thing driving it.
 """
 
 from __future__ import annotations
@@ -69,9 +76,14 @@ class BeaconPhase(str, Enum):
     CONTINUOUS = "CONTINUOUS"
     PERIODIC_ON = "PERIODIC_ON"
     PERIODIC_OFF = "PERIODIC_OFF"
+    # Phase 13: forced on by the phone's "find_my_drone" command, independent
+    # of link status. Same actuator effect as CONTINUOUS (both "on") -- a
+    # distinct enum value only so tests and mission_events can tell a manual
+    # trigger apart from an automatic link-loss activation.
+    MANUAL = "MANUAL"
 
 
-_ON_PHASES = frozenset({BeaconPhase.CONTINUOUS, BeaconPhase.PERIODIC_ON})
+_ON_PHASES = frozenset({BeaconPhase.CONTINUOUS, BeaconPhase.PERIODIC_ON, BeaconPhase.MANUAL})
 
 
 # ===========================================================================
@@ -86,18 +98,39 @@ def beacon_phase(
     periodic_interval_s: float,
     periodic_on_s: float,
     now_in_cycle: float,
+    *,
+    now_mono: float | None = None,
+    manual_until_mono: float | None = None,
 ) -> BeaconPhase:
     """Pure. No I/O, no clock reads.
 
     ``seconds_since_link_lost=None`` (link is up) always -> OFF, regardless
-    of every other argument.
+    of every other argument -- UNLESS a manual override is active (see
+    below), which wins even with link up: that is the whole point of a
+    manual "I can't see/hear it" trigger.
 
     ``now_in_cycle`` is time elapsed since entering the periodic regime
     (``seconds_since_link_lost - activate_delay_s - continuous_s``) -- it
     need not already be wrapped to one cycle's length; this function wraps
     it internally (``% (periodic_on_s + periodic_interval_s)``), so passing
     either the raw elapsed value or a pre-wrapped one gives the same answer.
+
+    ``manual_until_mono`` (Phase 13): when set and ``now_mono`` is before
+    it, the phase is unconditionally MANUAL, regardless of link status --
+    same actuator effect as CONTINUOUS, distinct enum value. Once
+    ``now_mono >= manual_until_mono`` this falls straight through to the
+    existing link-based computation below exactly as if no override had
+    ever existed -- expiry does NOT force OFF; if link is independently
+    down long enough to justify CONTINUOUS or PERIODIC, that is what it
+    lands on.
     """
+    if (
+        manual_until_mono is not None
+        and now_mono is not None
+        and now_mono < manual_until_mono
+    ):
+        return BeaconPhase.MANUAL
+
     if seconds_since_link_lost is None:
         return BeaconPhase.OFF
     if seconds_since_link_lost < activate_delay_s:
@@ -174,6 +207,13 @@ class BeaconMonitor:
         self._link_lost_since_mono: float | None = None
         self._last_phase = BeaconPhase.OFF
 
+        # Phase 13: the manual "find_my_drone" override. Written from the
+        # command-intake thread via trigger_manual(), read from the beacon's
+        # own tick thread -- a separate lock from anything else here since
+        # the two threads never otherwise touch shared state.
+        self._manual_lock = threading.Lock()
+        self._manual_until_mono: float | None = None
+
     # -- lifecycle --
 
     def start(self) -> None:
@@ -190,6 +230,23 @@ class BeaconMonitor:
     @property
     def phase(self) -> BeaconPhase:
         return self._last_phase
+
+    # -- manual override (Phase 13) --
+
+    def trigger_manual(self, duration_s: float) -> None:
+        """Force the beacon on for ``duration_s`` seconds, regardless of link
+        status. Thread-safe -- called from the command-intake thread, not
+        this monitor's own tick thread.
+
+        There is exactly ONE thing driving the payload actuator: this method
+        does not touch the actuator itself, it only sets/extends the
+        override end-time that the next tick's :func:`beacon_phase` call
+        reads. Calling it again while already within an active window just
+        pushes the end-time forward (debounce) -- it never stacks durations
+        and never restarts from some other reference point.
+        """
+        with self._manual_lock:
+            self._manual_until_mono = time.monotonic() + duration_s
 
     # -- construction-time config read (R10) --
 
@@ -243,6 +300,9 @@ class BeaconMonitor:
                 0.0, seconds_since_link_lost - self._activate_delay_s - self._continuous_s
             )
 
+        with self._manual_lock:
+            manual_until_mono = self._manual_until_mono
+
         phase = beacon_phase(
             seconds_since_link_lost,
             self._activate_delay_s,
@@ -250,6 +310,8 @@ class BeaconMonitor:
             self._periodic_interval_s,
             self._periodic_on_s,
             now_in_cycle,
+            now_mono=now_mono,
+            manual_until_mono=manual_until_mono,
         )
 
         if phase == self._last_phase:

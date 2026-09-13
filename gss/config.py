@@ -445,6 +445,11 @@ BEACON_ACTIVATE_DELAY_S_DEFAULT: float = _get_float("BEACON_ACTIVATE_DELAY_S_DEF
 BEACON_CONTINUOUS_S_DEFAULT: float = _get_float("BEACON_CONTINUOUS_S_DEFAULT", 120.0)
 BEACON_PERIODIC_INTERVAL_S_DEFAULT: float = _get_float("BEACON_PERIODIC_INTERVAL_S_DEFAULT", 300.0)
 BEACON_PERIODIC_ON_S_DEFAULT: float = _get_float("BEACON_PERIODIC_ON_S_DEFAULT", 15.0)
+# Phase 13: the manual "find_my_drone" command's beacon duration. Real value
+# lives in system_config ("beacon.manual_trigger_s"), read fresh by
+# gss/commands.py each time the command is handled (NOT cached at startup --
+# an operator may retune it at runtime); this is only the fallback.
+BEACON_MANUAL_TRIGGER_S_DEFAULT: float = _get_float("BEACON_MANUAL_TRIGGER_S_DEFAULT", 60.0)
 
 # --- gss/scheduler.py (v0.9): patrol scheduler ------------------------------
 # Recurring flights ("patrol this land every day at 7am"). Its entire
@@ -778,6 +783,7 @@ def _validate() -> None:
         ("BEACON_CONTINUOUS_S_DEFAULT", BEACON_CONTINUOUS_S_DEFAULT),
         ("BEACON_PERIODIC_INTERVAL_S_DEFAULT", BEACON_PERIODIC_INTERVAL_S_DEFAULT),
         ("BEACON_PERIODIC_ON_S_DEFAULT", BEACON_PERIODIC_ON_S_DEFAULT),
+        ("BEACON_MANUAL_TRIGGER_S_DEFAULT", BEACON_MANUAL_TRIGGER_S_DEFAULT),
     ):
         if _value <= 0:
             errors.append(f"{_name} must be positive, got {_value}")

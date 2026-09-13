@@ -39,6 +39,7 @@ import queue
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -345,9 +346,16 @@ class CommandIntake:
         weather: WeatherMonitor | None = None,
         link=None,
         adopted_detail: dict | None = None,
+        beacon_trigger: Callable[[float], None] | None = None,
     ) -> None:
         self._store = store
         self._snapshot = snapshot_source
+        # Phase 13: gss.beacon.BeaconMonitor.trigger_manual, bound to the ONE
+        # BeaconMonitor instance main.py constructed -- routing the manual
+        # find_my_drone command through it (rather than a direct actuator
+        # call from here) keeps exactly one thing driving the payload
+        # actuator. None when beacon.py is disabled/unavailable.
+        self._beacon_trigger = beacon_trigger
         # v0.6: the MAVLink link, so make_executor() can build a real
         # MavlinkExecutor. None while ALLOW_VEHICLE_CONTROL is false -- the
         # factory never needs it for the dry runner.
@@ -584,6 +592,9 @@ class CommandIntake:
             return
         if ctype == "weather_recall":
             self._handle_weather_answer(cmd, server_now, recall=True)
+            return
+        if ctype == "find_my_drone":
+            self._handle_find_my_drone(cmd, server_now)
             return
 
         reason = self._validate_flight(cmd, server_now)
@@ -1200,6 +1211,68 @@ class CommandIntake:
             sync=True,
         )
         self._set_status(command_id, "done")
+
+    # ---------------------------------------------------------- find_my_drone (Phase 13)
+
+    def _handle_find_my_drone(self, cmd: dict, server_now: datetime) -> None:
+        """Manual find-my-drone trigger: forces gss/beacon.py's
+        BeaconMonitor into its MANUAL phase for a configurable duration.
+
+        Never flies the drone, never touches safety.py -- same category as
+        the Phase 11 SOS alert, a side-effect independent of flight
+        dispatch. Routes through the ONE BeaconMonitor instance's
+        trigger_manual() (injected as self._beacon_trigger) rather than
+        driving the payload actuator directly from here -- there must be
+        exactly one thing driving it (see gss/beacon.py's module docstring).
+        """
+        command_id = cmd["id"]
+        expired = self._expiry_reason(cmd, server_now)
+        if expired:
+            self._reject(command_id, expired)
+            return
+        if self._beacon_trigger is None:
+            self._reject(command_id, "beacon not enabled")
+            return
+
+        # Read fresh every time (not cached at startup): an operator may
+        # retune this in system_config at runtime.
+        duration_s = config.BEACON_MANUAL_TRIGGER_S_DEFAULT
+        if self._store is not None:
+            try:
+                duration_s = float(
+                    self._store.get_system_config(
+                        "beacon.manual_trigger_s", config.BEACON_MANUAL_TRIGGER_S_DEFAULT
+                    )
+                )
+            except Exception:  # noqa: BLE001 -- R10: never block on a bad read
+                log.warning(
+                    "find_my_drone: system_config read failed; using default %.0fs",
+                    config.BEACON_MANUAL_TRIGGER_S_DEFAULT,
+                )
+                duration_s = config.BEACON_MANUAL_TRIGGER_S_DEFAULT
+
+        try:
+            self._beacon_trigger(duration_s)
+        except Exception:
+            log.exception("command %s: beacon_trigger raised", command_id)
+            self._reject(
+                command_id, "internal error triggering the beacon (see the GSS log)"
+            )
+            return
+
+        with self._active_lock:
+            active = self._active
+        if active is not None:
+            self._store.log_event(
+                active.mission_id, "beacon_manual_triggered",
+                detail={"duration_s": duration_s, "command_id": command_id},
+                sync=True,
+            )
+        self._set_status(command_id, "done")
+        log.info(
+            "command %s: find_my_drone triggered the beacon for %.0fs",
+            command_id, duration_s,
+        )
 
     # ---------------------------------------------------------- supervisor
 

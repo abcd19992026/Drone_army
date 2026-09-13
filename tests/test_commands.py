@@ -423,6 +423,34 @@ def test_11_sos_maps_to_family_summon():
         rig.close()
 
 
+def test_12_find_my_drone_without_beacon_configured_is_rejected_cleanly():
+    """Phase 13: 'find_my_drone' is now dispatched through the new
+    _handle_find_my_drone branch, not the old 'not handled yet' fallback.
+    This suite's rig has no beacon wired (same reasoning as ALERTS_ENABLED
+    being off here) -- gss/beacon.py's MANUAL phase and the full
+    _handle_find_my_drone logic (active-mission event, retried failures,
+    system_config fallback) are covered by tests/test_beacon.py's MagicMock
+    suite. This only proves the real claim/dispatch pipeline reaches the new
+    branch and terminates cleanly via the real 'beacon not enabled' path
+    instead of crashing or falling through to 'not handled yet'.
+    """
+    _wipe()
+    rig = _Rig()
+    try:
+        cmd = _rest("POST", "/rest/v1/commands",
+                    {"drone_id": DRONE, "type": "find_my_drone", "status": "pending",
+                     "issued_by": "test_commands"})[0]
+        _wait(lambda: _command(cmd["id"])["status"] == "rejected", 15)
+        row = _command(cmd["id"])
+        _check("12: find_my_drone rejected cleanly (no beacon wired in this rig)",
+               row["status"] == "rejected", row["status"])
+        _check("12: reason is the beacon-not-enabled path, not 'not handled yet'",
+               row["rejected_reason"] == "beacon not enabled", row["rejected_reason"])
+        _check("12: no mission created", row["mission_id"] is None)
+    finally:
+        rig.close()
+
+
 def main() -> int:
     tests = [
         test_1_valid_summon, test_2_out_of_range, test_3_expired,
@@ -430,6 +458,7 @@ def main() -> int:
         test_6_duplicate_exactly_once, test_7_stale_telemetry,
         test_8_abort_during_run, test_9_clock_skew_simulated, test_10_poller_only,
         test_11_sos_maps_to_family_summon,
+        test_12_find_my_drone_without_beacon_configured_is_rejected_cleanly,
     ]
     for t in tests:
         print(f"\n--- {t.__name__} ---")

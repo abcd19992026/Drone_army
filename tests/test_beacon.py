@@ -30,6 +30,33 @@ Verification items (per the Phase 12 spec):
 
 (Item 10 -- all earlier suites still pass -- is a full-repo `pytest tests/`
 run, not a test in this file.)
+
+Phase 13 (manual "find_my_drone" trigger) verification items:
+  1  trigger_manual(60) with link currently up -> phase becomes MANUAL,
+     spotlight_on + siren_on called exactly once.
+  2  Calling trigger_manual again before the first expires -> end-time
+     extends, no duplicate actuator calls (still MANUAL, no transition).
+  3  Manual duration expires, link is up -> phase falls back to OFF,
+     spotlight_off + siren_off called.
+  4  Manual duration expires, link has been down long enough to qualify for
+     CONTINUOUS -> phase becomes CONTINUOUS, no redundant off/on toggle
+     (MANUAL and CONTINUOUS are both "on").
+  5  gss/commands.py's get_system_config read for "beacon.manual_trigger_s"
+     unreachable -> falls back to the hardcoded default, doesn't crash.
+  6  commands.py: find_my_drone with no active mission -> command marked
+     done, no mission_events write attempted.
+  7  commands.py: find_my_drone with an active mission -> exactly one
+     mission_events row with event="beacon_manual_triggered".
+  8  commands.py: beacon_trigger callable raises -> command marked
+     rejected with a reason, a later ordinary command still processes.
+  9  commands.py: beacon_trigger is None (beacon disabled) -> find_my_drone
+     rejected with "beacon not enabled", not a crash or a silent no-op.
+
+Items 5-9 exercise gss.commands.CommandIntake._handle_find_my_drone
+directly (same MagicMock-store, no-thread style as the Phase 11
+independence tests in tests/test_alerts.py) rather than the live-Supabase
+suite in tests/test_commands.py, which only gets one confirming assertion
+that a real find_my_drone command reaches 'done'.
 """
 
 from __future__ import annotations
@@ -37,7 +64,9 @@ from __future__ import annotations
 import inspect
 import os
 import re
-from unittest.mock import MagicMock
+import time as _time
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("SUPABASE_ENABLED", "false")
 os.environ.setdefault("WEATHER_ENABLED", "false")
@@ -45,6 +74,7 @@ os.environ.setdefault("MEDIA_ENABLED", "false")
 
 from gss import config
 from gss.beacon import BeaconMonitor, BeaconPhase, beacon_phase
+from gss.commands import CommandIntake
 from gss.payload import FakePayloadActuator, RealPayloadActuator
 
 # Small, fast timings shared by most tests: activate at 10s, continuous for
@@ -330,3 +360,216 @@ def test_9_real_actuator_raises_caught_never_crashes():
     # state when the actuator call that defines it failed) -- phase stays
     # at the last successfully-reached one.
     assert monitor.phase == BeaconPhase.PENDING
+
+
+# ===========================================================================
+# Phase 13 -- manual "find_my_drone" trigger
+# ===========================================================================
+#
+# trigger_manual() stamps its end-time from the REAL time.monotonic(), while
+# these tests otherwise drive tick() with synthetic now_mono values. To keep
+# both readings on one consistent imaginary timeline, time.monotonic() is
+# patched (via gss.beacon.time.monotonic) only for the duration of each
+# trigger_manual() call, to a value chosen on that same synthetic timeline.
+
+# ── P13-1: trigger_manual with link up -> MANUAL, activates once ──────
+
+def test_p13_1_trigger_manual_with_link_up_activates():
+    snap = _snap(True)
+    actuator = FakePayloadActuator()
+    monitor = _monitor(lambda: snap, actuator=actuator)
+
+    monitor.tick(now_mono=0.0)
+    assert monitor.phase == BeaconPhase.OFF
+
+    with patch("gss.beacon.time.monotonic", return_value=100.0):
+        monitor.trigger_manual(60.0)  # until 160.0
+    monitor.tick(now_mono=101.0)
+
+    assert monitor.phase == BeaconPhase.MANUAL
+    assert len(_on_calls(actuator)) == 2
+
+
+# ── P13-2: a second trigger before expiry extends, no duplicate calls ──
+
+def test_p13_2_trigger_manual_again_extends_no_duplicate_calls():
+    snap = _snap(True)
+    actuator = FakePayloadActuator()
+    monitor = _monitor(lambda: snap, actuator=actuator)
+
+    with patch("gss.beacon.time.monotonic", return_value=100.0):
+        monitor.trigger_manual(60.0)  # until 160.0
+    monitor.tick(now_mono=110.0)
+    assert monitor.phase == BeaconPhase.MANUAL
+    assert len(_on_calls(actuator)) == 2
+
+    with patch("gss.beacon.time.monotonic", return_value=150.0):
+        monitor.trigger_manual(60.0)  # until 210.0 -- extended, not stacked (150+60, not 160+60)
+    # 180 is past the OLD end-time (160) but well within the NEW one (210)
+    monitor.tick(now_mono=180.0)
+
+    assert monitor.phase == BeaconPhase.MANUAL
+    assert len(_on_calls(actuator)) == 2  # unchanged -- no transition, no duplicate call
+
+
+# ── P13-3: expiry with link up -> falls back to OFF ────────────────────
+
+def test_p13_3_manual_expires_link_up_falls_back_to_off():
+    snap = _snap(True)
+    actuator = FakePayloadActuator()
+    monitor = _monitor(lambda: snap, actuator=actuator)
+
+    with patch("gss.beacon.time.monotonic", return_value=100.0):
+        monitor.trigger_manual(60.0)  # until 160.0
+    monitor.tick(now_mono=110.0)
+    assert monitor.phase == BeaconPhase.MANUAL
+
+    monitor.tick(now_mono=161.0)  # past 160 -- expired, link is up -> OFF
+
+    assert monitor.phase == BeaconPhase.OFF
+    assert len(_off_calls(actuator)) == 2
+
+
+# ── P13-4: expiry with link down long enough -> CONTINUOUS, no redundant toggle ──
+
+def test_p13_4_manual_expires_link_down_falls_through_to_continuous():
+    snap = _snap(False)  # link down throughout
+    actuator = FakePayloadActuator()
+    monitor = _monitor(lambda: snap, actuator=actuator)
+
+    monitor.tick(now_mono=0.0)  # link-loss timer starts at 0
+
+    with patch("gss.beacon.time.monotonic", return_value=1.0):
+        monitor.trigger_manual(5.0)  # until 6.0
+    monitor.tick(now_mono=2.0)
+    assert monitor.phase == BeaconPhase.MANUAL
+    assert len(_on_calls(actuator)) == 2
+
+    # manual expired (20 >= 6); elapsed since link loss is 20s -- within
+    # [activate_delay=10, +continuous=30) -> CONTINUOUS
+    monitor.tick(now_mono=20.0)
+
+    assert monitor.phase == BeaconPhase.CONTINUOUS
+    assert len(_on_calls(actuator)) == 2  # MANUAL->CONTINUOUS is on->on: no new call
+
+
+# ── commands.py: _handle_find_my_drone (Phase 13 items 5-9) ────────────
+
+def _find_my_drone_cmd(command_id: str = "cmd-fmd") -> dict:
+    return {
+        "id": command_id,
+        "type": "find_my_drone",
+        "issued_by": "phone",
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+        "expires_at": None,
+    }
+
+
+def _intake(*, store=None, beacon_trigger=None):
+    store = store if store is not None else MagicMock()
+    snap = MagicMock()
+    return CommandIntake(
+        store, lambda: snap, realtime_enabled=False, beacon_trigger=beacon_trigger,
+    )
+
+
+# ── P13-5: system_config unreachable for the manual-duration key ──────
+
+def test_p13_5_system_config_unreachable_for_manual_duration_falls_back():
+    store = MagicMock()
+    store.get_system_config.side_effect = RuntimeError("unreachable")
+    beacon_trigger = MagicMock()
+    intake = _intake(store=store, beacon_trigger=beacon_trigger)
+    cmd = _find_my_drone_cmd()
+
+    intake._handle_find_my_drone(cmd, datetime.now(timezone.utc))  # must not raise
+
+    beacon_trigger.assert_called_once_with(config.BEACON_MANUAL_TRIGGER_S_DEFAULT)
+    store.update_command_status.assert_called_once_with(
+        cmd["id"], "done", rejected_reason=None,
+    )
+
+
+# ── P13-6: no active mission -> done, no mission_events write ─────────
+
+def test_p13_6_no_active_mission_no_mission_event():
+    store = MagicMock()
+    store.get_system_config.return_value = 45.0
+    beacon_trigger = MagicMock()
+    intake = _intake(store=store, beacon_trigger=beacon_trigger)
+    cmd = _find_my_drone_cmd()
+
+    intake._handle_find_my_drone(cmd, datetime.now(timezone.utc))
+
+    beacon_trigger.assert_called_once_with(45.0)
+    store.log_event.assert_not_called()
+    store.update_command_status.assert_called_once_with(
+        cmd["id"], "done", rejected_reason=None,
+    )
+
+
+# ── P13-7: active mission -> exactly one beacon_manual_triggered event ─
+
+def test_p13_7_active_mission_gets_beacon_manual_triggered_event():
+    from gss.commands import _ActiveMission
+    from gss.executor import MissionPhase
+
+    store = MagicMock()
+    store.get_system_config.return_value = 30.0
+    beacon_trigger = MagicMock()
+    intake = _intake(store=store, beacon_trigger=beacon_trigger)
+    cmd = _find_my_drone_cmd()
+
+    intake._active = _ActiveMission(
+        mission_id="mission-x", command_id="other-cmd", command={"type": "summon"},
+        executor=MagicMock(), started_mono=_time.monotonic(),
+        last_phase=MissionPhase.QUEUED,
+    )
+
+    intake._handle_find_my_drone(cmd, datetime.now(timezone.utc))
+
+    store.log_event.assert_called_once_with(
+        "mission-x", "beacon_manual_triggered",
+        detail={"duration_s": 30.0, "command_id": cmd["id"]}, sync=True,
+    )
+
+
+# ── P13-8: beacon_trigger raises -> rejected, intake keeps working ─────
+
+def test_p13_8_beacon_trigger_raises_rejects_and_intake_keeps_running():
+    store = MagicMock()
+    store.get_system_config.return_value = 30.0
+    beacon_trigger = MagicMock(side_effect=RuntimeError("actuator fault"))
+    intake = _intake(store=store, beacon_trigger=beacon_trigger)
+    cmd = _find_my_drone_cmd()
+
+    intake._handle_find_my_drone(cmd, datetime.now(timezone.utc))  # must not raise
+
+    store.update_command_status.assert_called_once()
+    args, kwargs = store.update_command_status.call_args
+    assert args[1] == "rejected"
+    assert "internal error" in (kwargs.get("rejected_reason") or "")
+
+    # a later command still processes fine -- the fault didn't wedge intake
+    store.reset_mock()
+    beacon_trigger.side_effect = None
+    cmd2 = _find_my_drone_cmd(command_id="cmd-fmd-2")
+    intake._handle_find_my_drone(cmd2, datetime.now(timezone.utc))
+    store.update_command_status.assert_called_once_with(
+        cmd2["id"], "done", rejected_reason=None,
+    )
+
+
+# ── P13-9: beacon_trigger is None -> rejected "beacon not enabled" ─────
+
+def test_p13_9_beacon_trigger_none_rejected_not_enabled():
+    store = MagicMock()
+    intake = _intake(store=store, beacon_trigger=None)
+    cmd = _find_my_drone_cmd()
+
+    intake._handle_find_my_drone(cmd, datetime.now(timezone.utc))
+
+    store.update_command_status.assert_called_once_with(
+        cmd["id"], "rejected", rejected_reason="beacon not enabled",
+    )
+    store.get_system_config.assert_not_called()  # short-circuited before reading config

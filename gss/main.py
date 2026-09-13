@@ -126,7 +126,7 @@ def run() -> int:
         if beacon is not None:
             beacon.start()
 
-        intake = _make_intake(store, reader, safety, weather, link, adopted_detail)
+        intake = _make_intake(store, reader, safety, weather, link, adopted_detail, beacon)
         if store is not None:
             store.start()
         if intake is not None:
@@ -315,7 +315,7 @@ def _make_store(reader: TelemetryReader):
 
 
 def _make_intake(store, reader: TelemetryReader, safety, weather, link=None,
-                  adopted_detail: dict | None = None):
+                  adopted_detail: dict | None = None, beacon=None):
     """Build the command intake, or None. Requires the store (Supabase).
 
     A construction failure is logged and downgraded to None -- the GSS still
@@ -323,7 +323,13 @@ def _make_intake(store, reader: TelemetryReader, safety, weather, link=None,
     so an accepted flight command can build a real MavlinkExecutor (v0.6);
     ``adopted_detail`` (from the startup recovery check, run before this
     function) tells the orphan-mission reconciliation the truth about a vehicle
-    found airborne, instead of a generic "orphaned" message.
+    found airborne, instead of a generic "orphaned" message. ``beacon``
+    (Phase 13) is the BeaconMonitor instance already started by
+    ``_make_beacon`` -- its bound ``trigger_manual`` is handed through as the
+    find_my_drone hook so intake routes through the ONE thing driving the
+    payload actuator instead of calling it directly; ``None`` when the beacon
+    is disabled/unavailable, which find_my_drone then reports as such rather
+    than crashing.
     """
     if store is None:
         if config.SUPABASE_ENABLED:
@@ -337,6 +343,7 @@ def _make_intake(store, reader: TelemetryReader, safety, weather, link=None,
         return CommandIntake(
             store, reader.get_snapshot, safety=safety, weather=weather,
             link=link, adopted_detail=adopted_detail,
+            beacon_trigger=(beacon.trigger_manual if beacon is not None else None),
         )
     except Exception:
         log.exception("Could not initialise command intake; continuing without it")
