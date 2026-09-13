@@ -1352,7 +1352,10 @@ class SafetyMonitor:
         snapshot = self._snapshot_source()
         context = SafetyContext(
             preflight=True,
-            is_summon=(command.get("type") == "summon"),
+            # "sos" (Phase 11) flies to the phone's reported position exactly
+            # like a summon -- standoff offset and all -- so it shares the
+            # R2 lateral-offset check below.
+            is_summon=(command.get("type") in ("summon", "sos")),
             target_lat=_num(command.get("target_lat")),
             target_lon=_num(command.get("target_lon")),
             target_alt_m=_num(command.get("target_alt_m")),

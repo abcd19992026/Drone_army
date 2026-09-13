@@ -647,10 +647,12 @@ class TelemetryStore:
         status: str = "queued",
         template_name: str | None = None,
         detail: dict | None = None,
+        contacts_notified: list | None = None,
+        error_detail: str | None = None,
     ) -> str | None:
-        """INSERT an alerts row (v0.5). WhatsApp delivery is a later phase --
-        the row records that someone needs to be told, and why. Retried hard
-        like the other state writes: an unwritten 'no drone is coming' alert is
+        """INSERT an alerts row (v0.5; contacts_notified/error_detail added
+        Phase 11 for gss/alerts.py's WhatsApp SOS sender). Retried hard like
+        the other state writes: an unwritten 'no drone is coming' alert is
         the worst possible silent failure."""
         body = {
             "mission_id": mission_id,
@@ -658,6 +660,8 @@ class TelemetryStore:
             "status": status,
             "template_name": template_name,
             "detail": detail,
+            "contacts_notified": contacts_notified,
+            "error_detail": error_detail,
         }
         out = self._sync_call(
             "POST", "/rest/v1/alerts", None, body,
@@ -670,6 +674,31 @@ class TelemetryStore:
             return json.loads(out.body)[0]["id"]
         except (json.JSONDecodeError, IndexError, KeyError, TypeError):
             return None
+
+    # --------------------------------------------------------- contacts (Phase 11)
+
+    def get_active_contacts(self) -> list[dict]:
+        """Active trusted contacts, highest priority first (Phase 11 --
+        gss/alerts.py). Same empty-list-safe pattern as list_safe_spots (R10):
+        an unreachable Supabase and "no contacts configured" are
+        indistinguishable here, and both must be handled as "nothing to
+        notify", never a crash."""
+        out = self._sync_call(
+            "GET", "/rest/v1/contacts",
+            {
+                "active": "eq.true",
+                "select": "id,name,phone,relation,priority,active",
+                "order": "priority.desc",
+            },
+            None, attempts=3, timeout=6.0, what="list active contacts",
+        )
+        if not out.ok:
+            return []
+        try:
+            return list(json.loads(out.body))
+        except (json.JSONDecodeError, TypeError):
+            log.error("store: contacts query returned junk: %r", out.body[:200])
+            return []
 
     def list_pending_command_ids(self, drone_id: str) -> list[str]:
         """The poller's query: ids of pending commands for this drone."""

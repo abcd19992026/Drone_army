@@ -38,6 +38,10 @@ FOREIGN_DRONE = "d5030000-0000-4000-8000-0000000000ff"
 # (tests/test_weather.py) with a fake forecast source; it must not reach the
 # real internet from here.
 os.environ.setdefault("WEATHER_ENABLED", "false")
+# gss/alerts.py (Phase 11) has its own suite (tests/test_alerts.py) with a
+# MagicMock store; the "sos" test below only exercises the flight-mission
+# path (mapping to mission type 'family_summon'), not the WhatsApp alert.
+os.environ.setdefault("ALERTS_ENABLED", "false")
 
 from gss.commands import CommandIntake  # noqa: E402
 from gss.link import MavlinkLink  # noqa: E402
@@ -392,12 +396,40 @@ def test_10_poller_only():
         rig.close()
 
 
+def test_11_sos_maps_to_family_summon():
+    """Phase 11: 'sos' is now a KNOWN and FLIGHT command type, mapped to
+    mission type 'family_summon' -- otherwise gated and flown exactly like an
+    ordinary summon (see gss/commands.py's _mission_type_for). ALERTS_ENABLED
+    is false for this whole suite (see the top of the file), so this only
+    exercises the flight-mission path; the WhatsApp alert itself is covered
+    by tests/test_alerts.py.
+    """
+    _wipe()
+    rig = _Rig()
+    try:
+        cmd = _rest("POST", "/rest/v1/commands",
+                    {"drone_id": DRONE, "type": "sos", "status": "pending",
+                     "issued_by": "test_commands",
+                     "target_lat": 25.60, "target_lon": 85.21})[0]
+        _wait(lambda: _command(cmd["id"])["status"] == "done", 25)
+        row = _command(cmd["id"])
+        _check("11: sos command reaches 'done'", row["status"] == "done", row["status"])
+        mid = row["mission_id"]
+        _check("11: mission linked", bool(mid))
+        m = _mission(mid)
+        _check("11: mission type is 'family_summon' (mapped from 'sos')",
+               m is not None and m["type"] == "family_summon", str(m))
+    finally:
+        rig.close()
+
+
 def main() -> int:
     tests = [
         test_1_valid_summon, test_2_out_of_range, test_3_expired,
         test_4_foreign_drone, test_5_second_summon_while_running,
         test_6_duplicate_exactly_once, test_7_stale_telemetry,
         test_8_abort_during_run, test_9_clock_skew_simulated, test_10_poller_only,
+        test_11_sos_maps_to_family_summon,
     ]
     for t in tests:
         print(f"\n--- {t.__name__} ---")

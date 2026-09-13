@@ -379,6 +379,47 @@ LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
 # ---------------------------------------------------------------------------
 MEDIA_ENABLED: bool = _get_bool("MEDIA_ENABLED", True)
 
+# --- gss/alerts.py (Phase 11): WhatsApp SOS alerts --------------------------
+# The WhatsApp alert and the drone dispatch are two INDEPENDENT outcomes of
+# one "sos" command (PROJECT.md Section 13) -- neither blocks or depends on
+# the other. ALERTS_ENABLED=false means gss/commands.py never even imports
+# gss.alerts; an "sos" command still flies exactly as before.
+#
+# STATUS_PAGE_BASE_URL: the live status page (live location, drone feed,
+# "Call Police" button) is NOT built yet -- it is a later, separate phase.
+# The default below is deliberately an obviously-fake placeholder so nothing
+# breaks before that page exists; the WhatsApp message body just carries
+# f"{STATUS_PAGE_BASE_URL}/{mission_id}".
+#
+# WABA_* (WhatsApp Business API) credentials and the approved template name
+# are intentionally NOT defined here yet -- pending exact env var names /
+# template details from the operator's existing SmartDentist WABA setup.
+ALERTS_ENABLED: bool = _get_bool("ALERTS_ENABLED", True)
+STATUS_PAGE_BASE_URL: str = _get_str(
+    "STATUS_PAGE_BASE_URL", "http://TODO-status-page.example"
+)
+
+# WhatsApp Business Cloud API (Meta) -- a fresh "Drone Army Project" WABA,
+# separate from the operator's existing SmartDentist one. WABA_ID is mostly
+# informational (template management); the send call itself only needs
+# WABA_PHONE_NUMBER_ID + WABA_ACCESS_TOKEN.
+#
+# WABA_ACCESS_TOKEN MUST be a PERMANENT System User access token (Meta
+# Business Settings -> System Users -> generate new token, with
+# whatsapp_business_messaging permission and no expiration) -- never a
+# short-lived user / Graph API Explorer token. This process runs unattended
+# on the dock Pi for weeks at a time; a token that expires means every future
+# SOS alert silently fails until a human notices and regenerates it by hand.
+# Set the real value in .env only (gitignored) -- never commit it, never
+# paste it into a chat or a log line.
+WABA_ID: str = _get_str("WABA_ID", "")
+WABA_PHONE_NUMBER_ID: str = _get_str("WABA_PHONE_NUMBER_ID", "")
+WABA_ACCESS_TOKEN: str = _get_str("WABA_ACCESS_TOKEN", "")
+# No approved template yet. Left blank on purpose: gss/alerts.py's
+# AlertSender._send_one() checks for this and refuses to call the API (a
+# clear 'failed' alerts row, not a guessed request) until it is set.
+WABA_TEMPLATE_NAME: str = _get_str("WABA_TEMPLATE_NAME", "")
+
 # --- gss/scheduler.py (v0.9): patrol scheduler ------------------------------
 # Recurring flights ("patrol this land every day at 7am"). Its entire
 # vocabulary is: read patrol_schedules, write one row to commands. It never
@@ -699,6 +740,10 @@ def _validate() -> None:
                     f"Set MEDIA_ENABLED=false to disable media processing and skip "
                     f"this check."
                 )
+
+    # --- alerts.py (Phase 11) ---
+    if not STATUS_PAGE_BASE_URL:
+        errors.append("STATUS_PAGE_BASE_URL must not be empty")
 
     # --- scheduler.py (v0.9) ---
     for _name, _value in (

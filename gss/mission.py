@@ -435,7 +435,9 @@ class MavlinkExecutor(Executor):
         self._cruise_out = config.CRUISE_ALT_OUTBOUND
         self._cruise_in = config.CRUISE_ALT_INBOUND
         self._loiter_s = float(loiter_seconds) if loiter_seconds else 0.0
-        self._is_summon = command.get("type") == "summon"
+        # "sos" (Phase 11) flies to the phone's reported position exactly like
+        # a summon -- standoff offset and all.
+        self._is_summon = command.get("type") in ("summon", "sos")
 
         self._target_lat = _f(command.get("target_lat"))
         self._target_lon = _f(command.get("target_lon"))

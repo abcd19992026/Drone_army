@@ -84,9 +84,10 @@ _KNOWN_COMMAND_TYPES = frozenset({
     "start_recording", "stop_recording", "panorama", "follow_me",
     "spotlight_on", "spotlight_off", "siren_on", "siren_off", "speaker_talk",
     "drop_release", "find_my_drone", "weather_continue", "weather_recall",
+    "sos",
 })
 # What v0.3 actually acts on. Everything else known -> rejected "not handled yet".
-_FLIGHT_COMMAND_TYPES = frozenset({"summon", "goto"})
+_FLIGHT_COMMAND_TYPES = frozenset({"summon", "goto", "sos"})
 _MISSION_TYPE_FOR = {"summon": "summon", "goto": "manual"}
 _SCHEDULER_ISSUED_BY_PREFIX = "scheduler:"
 
@@ -101,12 +102,21 @@ def _mission_type_for(cmd: dict) -> str:
     weather-gated identically to any other 'goto': nothing here special-cases
     how a scheduled flight is handled, only what its resulting mission is
     labelled.
+
+    An ``sos`` command (Phase 11 -- gss/alerts.py) becomes a 'family_summon'
+    mission -- it flies exactly like a 'summon' (fly to the phone's current
+    location, standoff offset and all; see the is_summon wiring in
+    gss/safety.py and gss/mission.py), only the record-keeping label differs.
+    The WhatsApp alert that the same "sos" command also triggers is a
+    completely separate, unlinked action -- see _accept_flight below.
     """
     ctype = cmd["type"]
     if ctype == "goto" and str(cmd.get("issued_by") or "").startswith(
         _SCHEDULER_ISSUED_BY_PREFIX
     ):
         return "patrol"
+    if ctype == "sos":
+        return "family_summon"
     return _MISSION_TYPE_FOR[ctype]
 
 _EARTH_RADIUS_M = 6_371_000.0
@@ -704,6 +714,17 @@ class CommandIntake:
             cruise_alt_m=cruise_alt,
             triggered_by=cmd.get("issued_by") or "command",
         )
+
+        if cmd.get("type") == "sos":
+            # Phase 11: the WhatsApp alert and the flight dispatch are two
+            # INDEPENDENT outcomes of one "sos" command (PROJECT.md Section
+            # 13) -- fired here, right alongside mission creation, in its own
+            # try/except below. mission_id may be None if mission creation
+            # just failed above; the alert still goes out regardless, and a
+            # dead WhatsApp API must never delay or block the mission-reject
+            # path that follows.
+            self._fire_sos_alert(mission_id)
+
         if mission_id is None:
             log.error("command %s: could not create mission row; rejecting", command_id)
             self._reject(command_id, "internal error: could not create the mission")
@@ -740,6 +761,34 @@ class CommandIntake:
             "command %s ACCEPTED -> mission %s (%s). DRY RUN begins.",
             command_id, mission_id, mission_type,
         )
+
+    def _fire_sos_alert(self, mission_id: str | None) -> None:
+        """Fire the WhatsApp SOS alert (Phase 11 -- gss/alerts.py).
+
+        Genuinely independent of the flight dispatch: a geofence rejection, a
+        dead battery, bad weather -- none of that stops this from firing, and
+        conversely a dead WhatsApp API must never block or delay the drone
+        (its own R10 boundary lives in gss/alerts.py; this try/except is a
+        second, redundant backstop since AlertSender.send() is documented to
+        never raise). ``mission_id`` may be ``None`` if mission creation just
+        failed -- the alerts.mission_id column is nullable and the alert
+        still needs to go out.
+
+        A no-op (``gss.alerts`` is never imported) when ALERTS_ENABLED is
+        false.
+        """
+        if not config.ALERTS_ENABLED:
+            return
+        try:
+            from gss.alerts import AlertSender
+
+            AlertSender(self._store).send(mission_id)
+        except Exception:
+            log.exception(
+                "sos: alert send raised (mission dispatch is unaffected) -- "
+                "this should not happen, AlertSender.send() is supposed to "
+                "catch everything itself"
+            )
 
     def _start_executor(
         self, cmd: dict, mission_id: str, mission_type: str, command_id: str
@@ -794,7 +843,7 @@ class CommandIntake:
             preflight=False,
             phase=phase.value,
             mission_id=mission_id,
-            is_summon=(cmd.get("type") == "summon"),
+            is_summon=(cmd.get("type") in ("summon", "sos")),
             target_lat=cmd.get("target_lat"),
             target_lon=cmd.get("target_lon"),
             target_alt_m=cmd.get("target_alt_m"),
