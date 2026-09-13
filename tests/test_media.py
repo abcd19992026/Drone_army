@@ -74,9 +74,9 @@ def _stub_store(*, upload_raises: bool = False, create_returns_none: bool = Fals
     if upload_raises:
         store.upload_to_storage.side_effect = OSError("connection refused")
     else:
-        store.upload_to_storage.return_value = (
-            "https://example.supabase.co/storage/v1/object/public/recording-thumbnails/thumb.jpg"
-        )
+        # The bucket is private (Phase 8.1): upload_to_storage returns the
+        # bucket-relative object path, not a public URL.
+        store.upload_to_storage.return_value = "some-drone/some-mission/thumb.jpg"
     return store
 
 

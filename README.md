@@ -210,6 +210,14 @@ every other write is the GSS using the service_role key), enable Realtime on
 `acked_at` / `completed_at` / `started_at` / `ended_at` with the **database**
 clock -- a Pi's clock is not trustworthy after a power cut.
 
+The `recording-thumbnails` Storage bucket (Phase 8.1) follows the same
+model: it is **not public** -- only `authenticated` may read (RLS policy
+`recording_thumbnails_authenticated_read`), and only the GSS's service_role
+key may write. `gss/store.py`'s `upload_to_storage` returns the bucket
+object path, not a URL; the React app turns that into a displayable image
+via a client-side `createSignedUrl`/`.download()` call under the operator's
+own logged-in session.
+
 ## Command intake (v0.3)
 
 When Supabase is on, the GSS also runs `CommandIntake`: it learns about new

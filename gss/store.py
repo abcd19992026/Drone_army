@@ -862,14 +862,25 @@ class TelemetryStore:
     ) -> str:
         """Upload ``file_bytes`` to Supabase Storage.
 
-        Returns the public URL of the uploaded object.
+        Returns ``object_path`` (the bucket-relative key), not a URL. The
+        ``recording-thumbnails`` bucket is private (Phase 8.1) -- there is no
+        public URL. The value returned here is stored as-is in
+        ``recordings.thumbnail_url`` and resolved into a displayable image by
+        the React app at render time, either via
+        ``supabase.storage.from(bucket).createSignedUrl(path, expiry)`` or an
+        authenticated ``.download(path)``, using the operator's own logged-in
+        session -- gated by the `recording_thumbnails_authenticated_read`
+        storage RLS policy (see
+        supabase/migrations/20260913170000_secure_thumbnail_bucket.sql).
+
         Raises OSError / urllib.error.HTTPError on failure (R8: caller logs and
         sets flagged=True on the recording row rather than silently discarding).
 
         R6 compliance: this method has no size guard -- callers are responsible.
         Only thumbnails (a few hundred KB) should ever be passed here; the
-        method will happily upload a 4 GB video if asked, and that would violate
-        R6. The callers in media.py only ever call this for the thumbnail file.
+        bucket itself also enforces a 1 MiB / image-jpeg-only cap server-side
+        (see the same migration), which backs this up even against a caller
+        bug. The callers in media.py only ever call this for the thumbnail file.
         """
         url = self._base + f"/storage/v1/object/{bucket}/{object_path}"
         headers = {
@@ -883,10 +894,10 @@ class TelemetryStore:
             url, data=file_bytes, method="POST", headers=headers
         )
         with urllib.request.urlopen(request, timeout=timeout) as resp:
-            # Supabase Storage returns {Key: ...} on success
-            body = resp.read().decode("utf-8", "replace")
-        # Build the public URL: <base>/storage/v1/object/public/<bucket>/<path>
-        return self._base + f"/storage/v1/object/public/{bucket}/{object_path}"
+            # Supabase Storage returns {Key: ...} on success; drain the
+            # response so the connection is cleanly released.
+            resp.read()
+        return object_path
 
     def update_drone(self, **fields: object) -> bool:
         """PATCH the drones row for this drone. Used by media.py's scanner
