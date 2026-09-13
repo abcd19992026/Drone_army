@@ -88,6 +88,26 @@ _KNOWN_COMMAND_TYPES = frozenset({
 # What v0.3 actually acts on. Everything else known -> rejected "not handled yet".
 _FLIGHT_COMMAND_TYPES = frozenset({"summon", "goto"})
 _MISSION_TYPE_FOR = {"summon": "summon", "goto": "manual"}
+_SCHEDULER_ISSUED_BY_PREFIX = "scheduler:"
+
+
+def _mission_type_for(cmd: dict) -> str:
+    """Map a command to its mission type.
+
+    A ``goto`` command whose ``issued_by`` starts with ``"scheduler:"`` (v0.9
+    Patrol Scheduler, see gss/scheduler.py) becomes a 'patrol' mission instead
+    of 'manual' -- purely a record-keeping distinction. The command's own
+    ``type`` is unchanged and it is validated, safety-vetoed, and
+    weather-gated identically to any other 'goto': nothing here special-cases
+    how a scheduled flight is handled, only what its resulting mission is
+    labelled.
+    """
+    ctype = cmd["type"]
+    if ctype == "goto" and str(cmd.get("issued_by") or "").startswith(
+        _SCHEDULER_ISSUED_BY_PREFIX
+    ):
+        return "patrol"
+    return _MISSION_TYPE_FOR[ctype]
 
 _EARTH_RADIUS_M = 6_371_000.0
 _RECENT_IDS_CAP = 4000
@@ -672,7 +692,7 @@ class CommandIntake:
 
     def _accept_flight(self, cmd: dict, *, weather_note: tuple[str, ...] | None = None) -> None:
         command_id = cmd["id"]
-        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        mission_type = _mission_type_for(cmd)
         cruise_alt = cmd.get("target_alt_m") or self._on_station_alt_m
 
         mission_id = self._store.create_mission(
@@ -791,7 +811,7 @@ class CommandIntake:
         command (blocked it, or put the mission into awaiting_confirmation);
         False to let _accept_flight proceed (possibly with a note)."""
         now = datetime.now(timezone.utc)
-        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        mission_type = _mission_type_for(cmd)
         is_emergency = weather.is_emergency_mission(mission_type)
         verdict = self._weather.forecast_verdict(now=now)
         decision = weather.preflight_decision(
@@ -817,7 +837,7 @@ class CommandIntake:
 
     def _begin_awaiting_confirmation(self, cmd: dict, decision) -> None:
         command_id = cmd["id"]
-        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        mission_type = _mission_type_for(cmd)
         mission_id = self._store.create_mission(
             drone_id=self._drone_id, dock_id=self._dock_id, mission_type=mission_type,
             target_lat=cmd.get("target_lat"), target_lon=cmd.get("target_lon"),
@@ -921,7 +941,7 @@ class CommandIntake:
 
     def _launch_awaiting(self, awaiting: _AwaitingConfirmation) -> None:
         cmd = awaiting.command
-        mission_type = _MISSION_TYPE_FOR[cmd["type"]]
+        mission_type = _mission_type_for(cmd)
         with self._active_lock:
             self._awaiting = None
         self._store.log_event(

@@ -379,6 +379,18 @@ LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
 # ---------------------------------------------------------------------------
 MEDIA_ENABLED: bool = _get_bool("MEDIA_ENABLED", True)
 
+# --- gss/scheduler.py (v0.9): patrol scheduler ------------------------------
+# Recurring flights ("patrol this land every day at 7am"). Its entire
+# vocabulary is: read patrol_schedules, write one row to commands. It never
+# imports gss/link.py, gss/mission.py, or gss/safety.py, and never transmits
+# MAVLink (rule R11) -- a scheduled flight is a normal `goto` command, gated
+# by the identical commands.py pipeline (safety.py veto, weather.py hold) as
+# any human-issued one. No catch-up: a next_run_at more than
+# SCHEDULER_MAX_STALENESS_S in the past is skipped, not launched late.
+SCHEDULER_ENABLED: bool = _get_bool("SCHEDULER_ENABLED", True)
+SCHEDULER_TICK_S: float = _get_float("SCHEDULER_TICK_S", 60.0)
+SCHEDULER_MAX_STALENESS_S: float = _get_float("SCHEDULER_MAX_STALENESS_S", 1800.0)
+
 
 def _validate() -> None:
     """Reject nonsensical configuration at import time with a single clear error."""
@@ -687,6 +699,14 @@ def _validate() -> None:
                     f"Set MEDIA_ENABLED=false to disable media processing and skip "
                     f"this check."
                 )
+
+    # --- scheduler.py (v0.9) ---
+    for _name, _value in (
+        ("SCHEDULER_TICK_S", SCHEDULER_TICK_S),
+        ("SCHEDULER_MAX_STALENESS_S", SCHEDULER_MAX_STALENESS_S),
+    ):
+        if _value <= 0:
+            errors.append(f"{_name} must be positive, got {_value}")
 
     # --- mission.py (v0.6) ---
     for name, value in (

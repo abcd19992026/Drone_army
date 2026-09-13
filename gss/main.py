@@ -59,6 +59,7 @@ def run() -> int:
     safety = None
     weather = None
     intake = None
+    scheduler = None
     shutdown = threading.Event()
 
     try:
@@ -126,12 +127,19 @@ def run() -> int:
         if intake is not None:
             intake.start()
 
+        scheduler = _make_scheduler(store)
+        if scheduler is not None:
+            scheduler.start()
+
         while not shutdown.is_set():
             print(format_console_line(reader.get_snapshot()), flush=True)
             shutdown.wait(config.TELEMETRY_INTERVAL_S)
     except KeyboardInterrupt:
         log.info("Ctrl+C received, shutting down.")
     finally:
+        if scheduler is not None:
+            log.info("Stopping patrol scheduler...")
+            scheduler.close(timeout_s=3.0)
         if intake is not None:
             log.info("Stopping command intake...")
             intake.close(timeout_s=5.0)
@@ -229,6 +237,29 @@ def _make_weather(reader: TelemetryReader, store):
         )
     except Exception:
         log.exception("Could not initialise weather awareness; continuing without it")
+        return None
+
+
+def _make_scheduler(store):
+    """Build the patrol scheduler, or None. Requires the store (Supabase).
+
+    Not a hard requirement (rules R1/R10): with ``SCHEDULER_ENABLED=false``,
+    no store, or a construction failure, the GSS runs exactly as before --
+    recurring flights are a feature layered on top of the existing manual
+    command path, never a replacement for it.
+    """
+    if not config.SCHEDULER_ENABLED:
+        log.info("Patrol scheduler disabled (SCHEDULER_ENABLED=false).")
+        return None
+    if store is None:
+        log.info("Patrol scheduler needs Supabase; store is off, so it is too.")
+        return None
+    try:
+        from gss.scheduler import PatrolScheduler
+
+        return PatrolScheduler(store)
+    except Exception:
+        log.exception("Could not initialise the patrol scheduler; continuing without it")
         return None
 
 

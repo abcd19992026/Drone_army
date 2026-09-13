@@ -732,6 +732,79 @@ class TelemetryStore:
         except json.JSONDecodeError:
             return []
 
+    def create_command(
+        self,
+        *,
+        drone_id: str,
+        cmd_type: str,
+        target_lat: float | None = None,
+        target_lon: float | None = None,
+        target_alt_m: float | None = None,
+        params: dict | None = None,
+        issued_by: str | None = None,
+    ) -> str | None:
+        """INSERT a commands row; return its id or None.
+
+        Used by gss/scheduler.py (v0.9) to submit a scheduled flight. The row
+        it creates is indistinguishable from a phone-issued one to the rest
+        of the pipeline -- it goes through the exact same commands.py gates
+        (safety.py veto, weather.py hold). This method performs no
+        validation of its own; that is commands.py's job, not the writer's.
+        """
+        body = {
+            "drone_id": drone_id,
+            "type": cmd_type,
+            "target_lat": target_lat,
+            "target_lon": target_lon,
+            "target_alt_m": target_alt_m,
+            "params": params,
+            "issued_by": issued_by,
+        }
+        out = self._sync_call(
+            "POST", "/rest/v1/commands", None, body,
+            prefer="return=representation", what="create_command",
+        )
+        if not out.ok:
+            return None
+        try:
+            rows = json.loads(out.body)
+            return rows[0]["id"]
+        except (json.JSONDecodeError, IndexError, KeyError):
+            log.error("store: create_command returned no id: %r", out.body[:200])
+            return None
+
+    # --------------------------------------------------------- patrol scheduler (v0.9)
+
+    def get_active_patrol_schedules(self) -> list[dict]:
+        """All active patrol_schedules rows. Due-filtering against the clock
+        happens in the pure gss.scheduler.due_schedules(), not here."""
+        out = self._sync_call(
+            "GET", "/rest/v1/patrol_schedules",
+            {
+                "active": "eq.true",
+                "select": "id,name,target_lat,target_lon,cruise_alt_m,"
+                          "loiter_seconds,cadence,time_of_day,days_of_week,"
+                          "active,next_run_at,dock_id",
+            },
+            None, attempts=3, timeout=6.0, what="list active patrol schedules",
+        )
+        if not out.ok:
+            return []
+        try:
+            return list(json.loads(out.body))
+        except (json.JSONDecodeError, TypeError):
+            log.error("store: patrol-schedules query returned junk: %r", out.body[:200])
+            return []
+
+    def update_patrol_schedule(self, schedule_id: str, **fields: object) -> bool:
+        """PATCH a patrol_schedules row (last_run_at / next_run_at /
+        last_skipped_reason bookkeeping)."""
+        out = self._sync_call(
+            "PATCH", "/rest/v1/patrol_schedules", {"id": f"eq.{schedule_id}"},
+            dict(fields), what=f"patrol schedule {schedule_id} update {list(fields)}",
+        )
+        return out.ok
+
     # --------------------------------------------------------- recordings (v0.8)
 
     def create_recording(
