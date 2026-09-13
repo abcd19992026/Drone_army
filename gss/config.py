@@ -17,6 +17,7 @@ that later versions never redefine them in another file.
 from __future__ import annotations
 
 import os
+import shutil
 
 from dotenv import load_dotenv
 
@@ -342,8 +343,41 @@ SAFE_SPOTS_FALLBACK: tuple[dict[str, object], ...] = (
      "surface": "open_ground", "has_marker": True, "height_above_dock_m": 0.0},
 )
 
+# --- media.py (v0.8) -------------------------------------------------------
+# Recording pipeline configuration. These control the scanner, the retention
+# pass, and the ffmpeg/ffprobe invocations. None of these values affect
+# safety or the MAVLink path; they are purely for the local file processor.
+#
+# IMPORTANT: ffmpeg and ffprobe must be installed for the GSS to start with
+# media processing active. If they are missing, _validate() raises a clear
+# error at import time (R8: no silent failures). Install ffmpeg on the Pi
+# (or wherever the GSS runs) with: sudo apt-get install ffmpeg
+RECORDINGS_DIR: str = _get_str("RECORDINGS_DIR", "./recordings")
+RECORDINGS_THUMBNAIL_BUCKET: str = _get_str(
+    "RECORDINGS_THUMBNAIL_BUCKET", "recording-thumbnails"
+)
+MEDIA_FILE_SETTLE_S: float = _get_float("MEDIA_FILE_SETTLE_S", 3.0)
+MEDIA_SCAN_INTERVAL_S: float = _get_float("MEDIA_SCAN_INTERVAL_S", 10.0)
+RETENTION_SCAN_INTERVAL_S: float = _get_float("RETENTION_SCAN_INTERVAL_S", 3600.0)
+# Paths to the ffmpeg and ffprobe executables. Override if they are installed
+# in a non-standard location (e.g. FFMPEG_PATH=/usr/local/bin/ffmpeg).
+FFMPEG_PATH: str = _get_str("FFMPEG_PATH", "ffmpeg")
+FFPROBE_PATH: str = _get_str("FFPROBE_PATH", "ffprobe")
+# How many days after a recording is created before the local video file
+# is eligible for deletion by the retention pass. The recordings row is kept
+# permanently; only the local file is removed. Flagged files are exempt.
+RECORDING_KEEP_DAYS: int = int(_get_float("RECORDING_KEEP_DAYS", 30))
+
+
 # --- Logging ---------------------------------------------------------------
 LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
+
+# ---------------------------------------------------------------------------
+# Whether media processing is enabled. Set MEDIA_ENABLED=false to skip the
+# fftools startup check and the scanner entirely (useful in CI environments
+# where ffmpeg is not installed and recording tests are mocked).
+# ---------------------------------------------------------------------------
+MEDIA_ENABLED: bool = _get_bool("MEDIA_ENABLED", True)
 
 
 def _validate() -> None:
@@ -622,6 +656,37 @@ def _validate() -> None:
     for _spot in SAFE_SPOTS_FALLBACK:
         if not {"name", "lat", "lon"} <= set(_spot):
             errors.append(f"SAFE_SPOTS_FALLBACK row missing name/lat/lon: {_spot}")
+
+    # --- media.py (v0.8) ---
+    if not RECORDINGS_DIR:
+        errors.append("RECORDINGS_DIR must not be empty")
+    if not RECORDINGS_THUMBNAIL_BUCKET:
+        errors.append("RECORDINGS_THUMBNAIL_BUCKET must not be empty")
+    for _name, _value in (
+        ("MEDIA_FILE_SETTLE_S", MEDIA_FILE_SETTLE_S),
+        ("MEDIA_SCAN_INTERVAL_S", MEDIA_SCAN_INTERVAL_S),
+        ("RETENTION_SCAN_INTERVAL_S", RETENTION_SCAN_INTERVAL_S),
+    ):
+        if _value <= 0:
+            errors.append(f"{_name} must be positive, got {_value}")
+    if not FFMPEG_PATH:
+        errors.append("FFMPEG_PATH must not be empty")
+    if not FFPROBE_PATH:
+        errors.append("FFPROBE_PATH must not be empty")
+    # R8: fail loudly at startup if ffmpeg/ffprobe are missing. A GSS
+    # running without them would silently skip all video processing, which
+    # violates R8. This check is gated on MEDIA_ENABLED so CI/test
+    # environments without ffmpeg can still import gss.config.
+    if MEDIA_ENABLED:
+        for _tool_name, _tool_path in (("ffmpeg", FFMPEG_PATH), ("ffprobe", FFPROBE_PATH)):
+            if not shutil.which(_tool_path):
+                errors.append(
+                    f"{_tool_name!r} not found at {_tool_path!r}. "
+                    f"Install ffmpeg (e.g. sudo apt-get install ffmpeg) or set "
+                    f"{_tool_name.upper()}_PATH in .env. "
+                    f"Set MEDIA_ENABLED=false to disable media processing and skip "
+                    f"this check."
+                )
 
     # --- mission.py (v0.6) ---
     for name, value in (

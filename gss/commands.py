@@ -1187,10 +1187,21 @@ class CommandIntake:
                 phase = active.executor.poll()
 
         # Extra events the executor itself produced (standoff computed or
-        # recomputed, a GPS-only landing note, ...) -- written off the flight
-        # path, like every other mission_events row, regardless of a phase change.
+        # recomputed, a GPS-only landing note, recording lifecycle ...) --
+        # written off the flight path, like every other mission_events row,
+        # regardless of a phase change.
         for event_name, detail in active.executor.drain_events():
             self._store.log_event(active.mission_id, event_name, detail=detail, sync=True)
+            # Recording lifecycle seam (v0.8): the executor emits these events
+            # at the points a real camera would start/stop. The supervisor
+            # mirrors the state into drones.recording_active so the ground
+            # station can show a live recording indicator without polling.
+            if event_name == "recording_started":
+                self._store.update_drone(recording_active=True)
+                log.info("mission %s: recording_active -> true (seam)", active.mission_id)
+            elif event_name == "recording_stopped":
+                self._store.update_drone(recording_active=False)
+                log.info("mission %s: recording_active -> false (seam)", active.mission_id)
 
         if phase == active.last_phase:
             return

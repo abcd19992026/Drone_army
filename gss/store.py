@@ -732,6 +732,174 @@ class TelemetryStore:
         except json.JSONDecodeError:
             return []
 
+    # --------------------------------------------------------- recordings (v0.8)
+
+    def create_recording(
+        self,
+        *,
+        drone_id: str,
+        mission_id: str | None = None,
+        local_path: str | None = None,
+        started_at: str | None = None,
+        duration_s: float | None = None,
+        size_mb: float | None = None,
+        thumbnail_url: str | None = None,
+        sha256: str | None = None,
+        media_type: str = "video",
+        width: int | None = None,
+        height: int | None = None,
+        lat: float | None = None,
+        lon: float | None = None,
+        flagged: bool = False,
+        detail: dict | None = None,
+        delete_after: str | None = None,
+    ) -> str | None:
+        """INSERT a recordings row. Returns the row id or None.
+
+        Retried hard -- a dropped recording index row means losing the
+        hash/thumbnail link to a file that may already be on disk. Follows
+        the same _sync_call pattern as create_mission (R10: Supabase slow or
+        dead never blocks the local pipeline; this is called from media.py's
+        own consumer thread, never the MAVLink path).
+        """
+        body = {
+            "drone_id": drone_id,
+            "mission_id": mission_id,
+            "local_path": local_path,
+            "started_at": started_at,
+            "duration_s": duration_s,
+            "size_mb": size_mb,
+            "thumbnail_url": thumbnail_url,
+            "sha256": sha256,
+            "media_type": media_type,
+            "width": width,
+            "height": height,
+            "lat": lat,
+            "lon": lon,
+            "flagged": flagged,
+            "detail": detail,
+            "delete_after": delete_after,
+        }
+        out = self._sync_call(
+            "POST", "/rest/v1/recordings", None, body,
+            prefer="return=representation", what="create_recording",
+        )
+        if not out.ok:
+            return None
+        try:
+            return json.loads(out.body)[0]["id"]
+        except (json.JSONDecodeError, IndexError, KeyError):
+            log.error("store: create_recording returned no id: %r", out.body[:200])
+            return None
+
+    def update_recording(self, recording_id: str, **fields: object) -> bool:
+        """PATCH a recordings row (e.g. clear local_path on retention, set flagged)."""
+        out = self._sync_call(
+            "PATCH", "/rest/v1/recordings", {"id": f"eq.{recording_id}"},
+            dict(fields),
+            what=f"recording {recording_id} update {list(fields)}",
+        )
+        return out.ok
+
+    def get_recording_by_sha256(
+        self, sha256: str, drone_id: str
+    ) -> dict | None:
+        """Check whether a file with this hash is already indexed (idempotency guard
+        so a scan-loop restart does not double-insert the same file)."""
+        out = self._sync_call(
+            "GET", "/rest/v1/recordings",
+            {
+                "sha256": f"eq.{sha256}",
+                "drone_id": f"eq.{drone_id}",
+                "select": "id,local_path,flagged",
+                "limit": "1",
+            },
+            None, attempts=3, timeout=6.0, what=f"get_recording_by_sha256({sha256[:8]}...)",
+        )
+        if not out.ok:
+            return None
+        try:
+            rows = json.loads(out.body)
+            return rows[0] if rows else None
+        except (json.JSONDecodeError, IndexError):
+            return None
+
+    def list_expired_recordings(self, drone_id: str, today_iso: str) -> list[dict]:
+        """Recordings whose delete_after date has passed, are not flagged, and
+        still have a local_path (file not yet deleted by a previous run).
+
+        R8: flagged=true rows are deliberately excluded -- a flagged recording
+        is kept past the normal window because a human wants it.
+        """
+        out = self._sync_call(
+            "GET", "/rest/v1/recordings",
+            {
+                "drone_id": f"eq.{drone_id}",
+                "delete_after": f"lt.{today_iso}",
+                "flagged": "eq.false",
+                "local_path": "not.is.null",
+                "select": "id,local_path",
+            },
+            None, attempts=3, timeout=6.0, what="list_expired_recordings",
+        )
+        if not out.ok:
+            return []
+        try:
+            return list(json.loads(out.body))
+        except (json.JSONDecodeError, TypeError):
+            log.error("store: expired-recordings query returned junk: %r", out.body[:200])
+            return []
+
+    def upload_to_storage(
+        self,
+        bucket: str,
+        object_path: str,
+        file_bytes: bytes,
+        content_type: str = "image/jpeg",
+        *,
+        upsert: bool = True,
+        timeout: float = 30.0,
+    ) -> str:
+        """Upload ``file_bytes`` to Supabase Storage.
+
+        Returns the public URL of the uploaded object.
+        Raises OSError / urllib.error.HTTPError on failure (R8: caller logs and
+        sets flagged=True on the recording row rather than silently discarding).
+
+        R6 compliance: this method has no size guard -- callers are responsible.
+        Only thumbnails (a few hundred KB) should ever be passed here; the
+        method will happily upload a 4 GB video if asked, and that would violate
+        R6. The callers in media.py only ever call this for the thumbnail file.
+        """
+        url = self._base + f"/storage/v1/object/{bucket}/{object_path}"
+        headers = {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            "Content-Type": content_type,
+        }
+        if upsert:
+            headers["x-upsert"] = "true"
+        request = urllib.request.Request(
+            url, data=file_bytes, method="POST", headers=headers
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            # Supabase Storage returns {Key: ...} on success
+            body = resp.read().decode("utf-8", "replace")
+        # Build the public URL: <base>/storage/v1/object/public/<bucket>/<path>
+        return self._base + f"/storage/v1/object/public/{bucket}/{object_path}"
+
+    def update_drone(self, **fields: object) -> bool:
+        """PATCH the drones row for this drone. Used by media.py's scanner
+        (via the supervisor) to toggle recording_active and by future phases.
+        Follows the same best-effort pattern as the telemetry writer.
+        """
+        out = self._sync_call(
+            "PATCH", "/rest/v1/drones", {"id": f"eq.{self._drone_id}"},
+            dict(fields),
+            what=f"update_drone {list(fields)}",
+        )
+        return out.ok
+
     # ------------------------------------------------------------ drops
 
     def _log_drops(self, force: bool = False) -> None:

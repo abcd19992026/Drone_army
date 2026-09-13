@@ -800,6 +800,16 @@ class MavlinkExecutor(Executor):
             if self._snapshot().armed is True:
                 log.info("mission %s: armed (ACK %s)", self._mission_id,
                          _result_name(ack[0]) if ack else "none")
+                # RECORDING SEAM: signal that a real camera would start now.
+                # mission.py has no camera hardware to control. This emit is
+                # the hook; the supervisor drains it and sets
+                # drones.recording_active = true in Supabase.
+                snap = self._snapshot()
+                self._emit("recording_started", {
+                    "note": "recording seam -- a real camera starts here",
+                    "lat": snap.lat if snap.position_valid else None,
+                    "lon": snap.lon if snap.position_valid else None,
+                })
                 return
             self._sleep(0.2)
         if self._stop.is_set():
@@ -981,6 +991,13 @@ class MavlinkExecutor(Executor):
                 break
             self._sleep(0.5)
         self._await_disarm_on_ground()
+        # RECORDING SEAM: signal that a real camera would stop here.
+        snap = self._snapshot()
+        self._emit("recording_stopped", {
+            "note": "recording seam -- a real camera stops here (land_now)",
+            "lat": snap.lat if snap.position_valid else None,
+            "lon": snap.lon if snap.position_valid else None,
+        })
 
     def _fly_to_divert(self) -> None:
         spot = self._divert_spot or {}
@@ -1009,6 +1026,13 @@ class MavlinkExecutor(Executor):
                 break
             self._sleep(0.5)
         self._await_disarm_on_ground()
+        # RECORDING SEAM: signal that a real camera would stop here.
+        snap = self._snapshot()
+        self._emit("recording_stopped", {
+            "note": "recording seam -- a real camera stops here (divert landing)",
+            "lat": snap.lat if snap.position_valid else None,
+            "lon": snap.lon if snap.position_valid else None,
+        })
 
     def _fly_home_and_land(self, *, mode: str) -> None:
         log.info("mission %s: %s to the dock", self._mission_id, mode)
@@ -1036,6 +1060,12 @@ class MavlinkExecutor(Executor):
                             "landing is a later phase)",
                 })
                 log.info("mission %s: down and disarmed after %s", self._mission_id, mode)
+                # RECORDING SEAM: signal that a real camera would stop here.
+                self._emit("recording_stopped", {
+                    "note": f"recording seam -- a real camera stops here ({mode.lower()})",
+                    "lat": snap.lat if snap.position_valid else None,
+                    "lon": snap.lon if snap.position_valid else None,
+                })
                 return
             self._sleep(1.0)
         if self._stop.is_set():
