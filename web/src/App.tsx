@@ -7,10 +7,12 @@ import { LiveStatusScreen } from './screens/LiveStatusScreen';
 import { MapScreen } from './screens/MapScreen';
 import { CommandsScreen } from './screens/CommandsScreen';
 import { MissionHistoryScreen } from './screens/MissionHistoryScreen';
+import { PatrolSchedulesScreen } from './screens/PatrolSchedulesScreen';
 import { AlertsScreen } from './screens/AlertsScreen';
 import { useDroneRealtime } from './hooks/useDroneRealtime';
 import { useCommands } from './hooks/useCommands';
 import { useMissions } from './hooks/useMissions';
+import { usePatrolSchedules } from './hooks/usePatrolSchedules';
 import { useAlerts } from './hooks/useAlerts';
 import type { ActiveScreen } from './types';
 import { Radio } from 'lucide-react';
@@ -36,6 +38,17 @@ export const App: React.FC = () => {
     loadingEvents,
     fetchMissionEvents,
   } = useMissions();
+
+  const {
+    schedules,
+    loading: schedulesLoading,
+    actionLoading: schedulesActionLoading,
+    statusMessage: schedulesStatusMessage,
+    createSchedule,
+    updateSchedule,
+    toggleScheduleActive,
+    deleteSchedule,
+  } = usePatrolSchedules();
 
   const { alerts, loading: alertsLoading } = useAlerts();
 
@@ -116,6 +129,19 @@ export const App: React.FC = () => {
             selectedMissionEvents={selectedMissionEvents}
             loadingEvents={loadingEvents}
             onSelectMission={fetchMissionEvents}
+          />
+        )}
+
+        {activeScreen === 'schedules' && (
+          <PatrolSchedulesScreen
+            schedules={schedules}
+            loading={schedulesLoading}
+            actionLoading={schedulesActionLoading}
+            statusMessage={schedulesStatusMessage}
+            onCreateSchedule={createSchedule}
+            onUpdateSchedule={updateSchedule}
+            onToggleActive={toggleScheduleActive}
+            onDeleteSchedule={deleteSchedule}
           />
         )}
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Map as MapIcon, Send, History, BellRing } from 'lucide-react';
+import { Activity, Map as MapIcon, Send, History, CalendarClock, BellRing } from 'lucide-react';
 import type { ActiveScreen } from '../types';
 
 interface NavigationProps {
@@ -43,6 +43,11 @@ export const Navigation: React.FC<NavigationProps> = ({
       id: 'missions',
       label: 'Missions',
       icon: <History className="w-5 h-5" />,
+    },
+    {
+      id: 'schedules',
+      label: 'Schedules',
+      icon: <CalendarClock className="w-5 h-5" />,
     },
     {
       id: 'alerts',

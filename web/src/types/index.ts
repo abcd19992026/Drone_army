@@ -179,4 +179,38 @@ export interface ContactRow {
   created_at: string;
 }
 
-export type ActiveScreen = 'status' | 'map' | 'commands' | 'missions' | 'alerts';
+export type ScheduleCadence = 'daily' | 'weekly';
+
+export interface PatrolScheduleRow {
+  id: string;
+  name: string;
+  target_lat: number;
+  target_lon: number;
+  cruise_alt_m: number | null;
+  loiter_seconds: number;
+  cadence: ScheduleCadence;
+  time_of_day: string; // HH:MM or HH:MM:SS
+  days_of_week: number[] | null; // 0=Sunday .. 6=Saturday (weekly only)
+  active: boolean;
+  last_run_at: string | null;
+  last_skipped_reason: string | null;
+  next_run_at: string;
+  dock_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PatrolScheduleFormData {
+  name: string;
+  target_lat: number | '';
+  target_lon: number | '';
+  cruise_alt_m: number | '' | null;
+  loiter_seconds: number | '';
+  cadence: ScheduleCadence;
+  time_of_day: string; // HH:MM
+  days_of_week: number[]; // 0..6
+  active: boolean;
+}
+
+export type ActiveScreen = 'status' | 'map' | 'commands' | 'missions' | 'schedules' | 'alerts';
+
