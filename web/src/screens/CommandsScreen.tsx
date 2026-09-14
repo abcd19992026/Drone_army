@@ -9,6 +9,8 @@ import {
   XCircle,
   ShieldAlert,
   HelpCircle,
+  Search,
+  AlertTriangle,
 } from 'lucide-react';
 import { WeatherHoldBanner } from '../components/WeatherHoldBanner';
 import { Badge } from '../components/Badge';
@@ -42,9 +44,13 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
 }) => {
   const [geoError, setGeoError] = useState<string | null>(null);
   const [geoLocating, setGeoLocating] = useState(false);
+  const [showSosModal, setShowSosModal] = useState(false);
 
-  // 1. Summon Handlers
-  const handleSummonHere = () => {
+  // Shared geolocation acquisition helper
+  const acquirePosition = (
+    actionName: string,
+    onSuccess: (lat: number, lon: number) => Promise<void>
+  ) => {
     setGeoError(null);
     if (!navigator.geolocation) {
       setGeoError('Geolocation is not supported by your browser.');
@@ -56,16 +62,13 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
       async (position) => {
         setGeoLocating(false);
         const { latitude, longitude } = position.coords;
-        await onIssueCommand('summon', {
-          target_lat: latitude,
-          target_lon: longitude,
-        });
+        await onSuccess(latitude, longitude);
       },
       (err) => {
         setGeoLocating(false);
         let msg = 'Could not acquire GPS position.';
         if (err.code === err.PERMISSION_DENIED) {
-          msg = 'Location permission denied. Please enable GPS location to summon.';
+          msg = `Location permission denied. Please enable GPS location to ${actionName}.`;
         } else if (err.code === err.POSITION_UNAVAILABLE) {
           msg = 'GPS location is unavailable.';
         } else if (err.code === err.TIMEOUT) {
@@ -75,6 +78,16 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
       },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
+  };
+
+  // 1. Summon Handlers
+  const handleSummonHere = () => {
+    acquirePosition('summon', async (latitude, longitude) => {
+      await onIssueCommand('summon', {
+        target_lat: latitude,
+        target_lon: longitude,
+      });
+    });
   };
 
   const handleSummon20kmBad = async () => {
@@ -87,7 +100,23 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
     });
   };
 
-  // 2. Weather Hold Handlers
+  // 2. SOS Handlers
+  const handleSosConfirm = () => {
+    setShowSosModal(false);
+    acquirePosition('trigger SOS', async (latitude, longitude) => {
+      await onIssueCommand('sos', {
+        target_lat: latitude,
+        target_lon: longitude,
+      });
+    });
+  };
+
+  // 3. Find My Drone Handler
+  const handleFindMyDrone = async () => {
+    await onIssueCommand('find_my_drone');
+  };
+
+  // 4. Weather Hold Handlers
   const handleWeatherContinue = async () => {
     if (!weatherHoldMission) return;
     await onIssueCommand('weather_continue', {
@@ -104,6 +133,48 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
 
   return (
     <div className="space-y-6 max-w-7xl mx-auto pb-16">
+      {/* SOS CONFIRMATION MODAL */}
+      {showSosModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+          <div className="bg-bg-card border-2 border-tactical-bad rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3 text-tactical-bad">
+              <div className="w-10 h-10 rounded-full bg-tactical-bad/20 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6 text-tactical-bad animate-pulse" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white uppercase tracking-wider">
+                  Confirm SOS Emergency
+                </h3>
+                <p className="text-xs text-tactical-bad font-mono">
+                  High Priority Emergency Dispatch
+                </p>
+              </div>
+            </div>
+
+            <p className="text-xs text-gray-300 leading-relaxed">
+              This will acquire your phone&apos;s current GPS coordinates, dispatch the drone immediately on an emergency mission, activate audio/visual beacons, and broadcast emergency alert notifications.
+            </p>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                onClick={() => setShowSosModal(false)}
+                className="px-4 py-2 rounded-xl bg-bg-cardElevated hover:bg-bg-line text-xs font-semibold text-gray-300 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSosConfirm}
+                disabled={isSending || geoLocating}
+                className="px-4 py-2 rounded-xl bg-tactical-bad hover:bg-tactical-bad/90 text-white text-xs font-bold transition-all shadow-lg shadow-tactical-bad/30 flex items-center gap-2"
+              >
+                <ShieldAlert className="w-4 h-4" />
+                <span>Confirm & Dispatch SOS</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 1. WEATHER HOLD HERO BANNER (Top Priority) */}
       {weatherHoldMission && (
         <WeatherHoldBanner
@@ -163,7 +234,7 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
         )}
 
         {/* Action Buttons Grid */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3.5">
           {/* Summon (Here) */}
           <button
             onClick={handleSummonHere}
@@ -173,10 +244,10 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
             <div className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
               <MapPin className="w-5 h-5 text-white" />
             </div>
-            <span className="text-sm uppercase tracking-wider">
+            <span className="text-sm uppercase tracking-wider text-center">
               {geoLocating ? 'Acquiring GPS...' : 'Summon (Here)'}
             </span>
-            <span className="text-[10px] font-normal text-blue-200 mt-0.5">
+            <span className="text-[10px] font-normal text-blue-200 mt-0.5 text-center">
               Launches drone to phone GPS coords
             </span>
           </button>
@@ -190,8 +261,8 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
             <div className="w-10 h-10 rounded-full bg-tactical-warn/10 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
               <Pause className="w-5 h-5 text-tactical-warn" />
             </div>
-            <span className="text-sm uppercase tracking-wider">Hold In Place</span>
-            <span className="text-[10px] font-normal text-gray-400 mt-0.5">
+            <span className="text-sm uppercase tracking-wider text-center">Hold In Place</span>
+            <span className="text-[10px] font-normal text-gray-400 mt-0.5 text-center">
               Pauses trajectory & loiters
             </span>
           </button>
@@ -205,9 +276,41 @@ export const CommandsScreen: React.FC<CommandsScreenProps> = ({
             <div className="w-10 h-10 rounded-full bg-tactical-bad/20 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
               <AlertOctagon className="w-5 h-5 text-tactical-bad" />
             </div>
-            <span className="text-sm uppercase tracking-wider">Abort & Return</span>
-            <span className="text-[10px] font-normal text-gray-300 mt-0.5">
+            <span className="text-sm uppercase tracking-wider text-center">Abort & Return</span>
+            <span className="text-[10px] font-normal text-gray-300 mt-0.5 text-center">
               Failsafe RTL back to dock
+            </span>
+          </button>
+
+          {/* Find My Drone */}
+          <button
+            onClick={handleFindMyDrone}
+            disabled={isSending}
+            className="flex flex-col items-center justify-center p-4 rounded-xl bg-bg-cardElevated hover:bg-bg-line border border-tactical-cyan/40 text-tactical-cyan font-bold transition-all disabled:opacity-50 active:scale-98 group"
+          >
+            <div className="w-10 h-10 rounded-full bg-tactical-cyan/10 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
+              <Search className="w-5 h-5 text-tactical-cyan" />
+            </div>
+            <span className="text-sm uppercase tracking-wider text-center">Find My Drone</span>
+            <span className="text-[10px] font-normal text-gray-400 mt-0.5 text-center">
+              Sound siren & blink beacon
+            </span>
+          </button>
+
+          {/* SOS Emergency */}
+          <button
+            onClick={() => setShowSosModal(true)}
+            disabled={isSending || geoLocating}
+            className="flex flex-col items-center justify-center p-4 rounded-xl bg-tactical-bad hover:bg-tactical-bad/90 text-white font-black transition-all disabled:opacity-50 shadow-lg shadow-tactical-bad/30 border-2 border-red-400 active:scale-98 group"
+          >
+            <div className="w-10 h-10 rounded-full bg-white/20 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
+              <ShieldAlert className="w-5 h-5 text-white" />
+            </div>
+            <span className="text-sm uppercase tracking-wider text-center flex items-center gap-1.5">
+              <span>SOS Emergency</span>
+            </span>
+            <span className="text-[10px] font-medium text-red-100 mt-0.5 text-center">
+              Emergency dispatch to my GPS
             </span>
           </button>
         </div>

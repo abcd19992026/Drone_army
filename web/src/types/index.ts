@@ -127,6 +127,8 @@ export type CommandType =
   | 'abort'
   | 'weather_continue'
   | 'weather_recall'
+  | 'sos'
+  | 'find_my_drone'
   | string;
 
 export type CommandStatus =

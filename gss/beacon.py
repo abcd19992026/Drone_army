@@ -333,11 +333,13 @@ class BeaconMonitor:
         if new_on and not prev_on:
             self._actuator.spotlight_on()
             self._actuator.siren_on()
+            self._update_beacon_active(True)
             event = "beacon_activated"
             log.warning("beacon: ACTIVATED (%s -> %s)", prev_phase.value, phase.value)
         elif prev_on and not new_on:
             self._actuator.spotlight_off()
             self._actuator.siren_off()
+            self._update_beacon_active(False)
             event = "beacon_deactivated"
             log.info("beacon: deactivated (%s -> %s)", prev_phase.value, phase.value)
         else:
@@ -345,6 +347,22 @@ class BeaconMonitor:
 
         if event is not None:
             self._write_mission_event(event, phase)
+
+    def _update_beacon_active(self, active: bool) -> None:
+        """Mirror the phase's on/off-ness into drones.beacon_active (Phase
+        14a) -- LiveStatusScreen has displayed this column since Phase 7,
+        but nothing ever wrote it. Same PATCH-on-transition-only discipline
+        as the actuator calls above (never every tick), via the same
+        single-column update store.py already uses for recording_active
+        (gss/commands.py's supervisor). Best-effort like the mission_events
+        write below: an unreachable store must not block the actuator
+        transition that already happened or crash the tick (R8/R10)."""
+        if self._store is None:
+            return
+        try:
+            self._store.update_drone(beacon_active=active)
+        except Exception:  # noqa: BLE001 -- R10
+            log.exception("beacon: drones.beacon_active update failed")
 
     def _write_mission_event(self, event: str, phase: BeaconPhase) -> None:
         """Only when a mission is currently active (non-terminal) -- see the

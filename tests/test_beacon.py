@@ -346,6 +346,110 @@ def test_8b_make_beacon_returns_none_when_disabled(monkeypatch):
     assert result is None
 
 
+# ── Phase 14a: drones.beacon_active mirrors the phase's on/off-ness ────
+#
+# store.update_drone(beacon_active=...) must fire exactly on the same
+# boundary crossings as the actuator calls (on->off / off->on), not on
+# every phase change (e.g. CONTINUOUS->PERIODIC_ON is on->on: no call).
+
+def _beacon_active_calls(store):
+    return [
+        c.kwargs["beacon_active"]
+        for c in store.update_drone.call_args_list
+        if "beacon_active" in c.kwargs
+    ]
+
+
+def test_p14a_entering_continuous_sets_beacon_active_true():
+    store = MagicMock()
+    store.list_active_missions.return_value = []
+    snap = _snap(False)
+    monitor = _monitor(lambda: snap, store=store)
+
+    monitor.tick(now_mono=0.0)
+    monitor.tick(now_mono=15.0)  # PENDING -> CONTINUOUS (off->on)
+
+    assert monitor.phase == BeaconPhase.CONTINUOUS
+    assert _beacon_active_calls(store) == [True]
+
+
+def test_p14a_periodic_on_off_toggles_beacon_active():
+    store = MagicMock()
+    store.list_active_missions.return_value = []
+    snap = _snap(False)
+    monitor = _monitor(lambda: snap, store=store)
+
+    monitor.tick(now_mono=0.0)
+    monitor.tick(now_mono=15.0)  # -> CONTINUOUS: beacon_active=True
+    monitor.tick(now_mono=30.0)  # -> PERIODIC_ON (on->on): no new call
+    assert _beacon_active_calls(store) == [True]
+
+    monitor.tick(now_mono=36.0)  # -> PERIODIC_OFF (on->off)
+    assert monitor.phase == BeaconPhase.PERIODIC_OFF
+    assert _beacon_active_calls(store) == [True, False]
+
+    monitor.tick(now_mono=45.0)  # -> PERIODIC_ON (off->on)
+    assert monitor.phase == BeaconPhase.PERIODIC_ON
+    assert _beacon_active_calls(store) == [True, False, True]
+
+
+def test_p14a_link_recovery_sets_beacon_active_false():
+    store = MagicMock()
+    store.list_active_missions.return_value = []
+    snap = _snap(False)
+    monitor = _monitor(lambda: snap, store=store)
+
+    monitor.tick(now_mono=0.0)
+    monitor.tick(now_mono=15.0)  # -> CONTINUOUS: beacon_active=True
+    assert _beacon_active_calls(store) == [True]
+
+    snap.connected = True
+    monitor.tick(now_mono=16.0)  # -> OFF (on->off)
+
+    assert monitor.phase == BeaconPhase.OFF
+    assert _beacon_active_calls(store) == [True, False]
+
+
+def test_p14a_manual_trigger_sets_beacon_active_true_and_false():
+    store = MagicMock()
+    store.list_active_missions.return_value = []
+    snap = _snap(True)
+    monitor = _monitor(lambda: snap, store=store)
+
+    with patch("gss.beacon.time.monotonic", return_value=100.0):
+        monitor.trigger_manual(60.0)  # until 160.0
+    monitor.tick(now_mono=101.0)  # OFF -> MANUAL (off->on)
+    assert monitor.phase == BeaconPhase.MANUAL
+    assert _beacon_active_calls(store) == [True]
+
+    monitor.tick(now_mono=161.0)  # expired, link up -> OFF (on->off)
+    assert monitor.phase == BeaconPhase.OFF
+    assert _beacon_active_calls(store) == [True, False]
+
+
+def test_p14a_no_store_no_crash():
+    snap = _snap(False)
+    monitor = _monitor(lambda: snap, store=None)
+
+    monitor.tick(now_mono=0.0)
+    monitor.tick(now_mono=15.0)  # must not raise despite no store
+
+    assert monitor.phase == BeaconPhase.CONTINUOUS
+
+
+def test_p14a_store_update_drone_raises_no_crash():
+    store = MagicMock()
+    store.list_active_missions.return_value = []
+    store.update_drone.side_effect = RuntimeError("unreachable")
+    snap = _snap(False)
+    monitor = _monitor(lambda: snap, store=store)
+
+    monitor.tick(now_mono=0.0)
+    monitor.tick(now_mono=15.0)  # must not raise despite update_drone failing
+
+    assert monitor.phase == BeaconPhase.CONTINUOUS
+
+
 # ── 9: a prematurely-real actuator's NotImplementedError is caught ────
 
 def test_9_real_actuator_raises_caught_never_crashes():
