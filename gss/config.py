@@ -21,7 +21,7 @@ import shutil
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 _VALID_LOG_LEVELS = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
 
