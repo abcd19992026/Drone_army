@@ -371,6 +371,15 @@ RECORDING_KEEP_DAYS: int = int(_get_float("RECORDING_KEEP_DAYS", 30))
 
 # --- Logging ---------------------------------------------------------------
 LOG_LEVEL: str = _get_str("LOG_LEVEL", "INFO").upper()
+# A crash traceback that only ever reaches an unattended console is a crash
+# traceback nobody can read afterwards -- found the hard way debugging a real
+# "internal error while handling the command" report where the only GSS
+# process that had actually hit it had no persisted log at all. Empty disables
+# file logging (console-only, the old behaviour); gss/main.py rotates it so an
+# unattended dock does not fill its disk.
+LOG_FILE_PATH: str = _get_str("LOG_FILE_PATH", "./gss.log")
+LOG_FILE_MAX_BYTES: int = _get_int("LOG_FILE_MAX_BYTES", 10 * 1024 * 1024)
+LOG_FILE_BACKUP_COUNT: int = _get_int("LOG_FILE_BACKUP_COUNT", 5)
 
 # ---------------------------------------------------------------------------
 # Whether media processing is enabled. Set MEDIA_ENABLED=false to skip the
@@ -385,11 +394,20 @@ MEDIA_ENABLED: bool = _get_bool("MEDIA_ENABLED", True)
 # the other. ALERTS_ENABLED=false means gss/commands.py never even imports
 # gss.alerts; an "sos" command still flies exactly as before.
 #
-# STATUS_PAGE_BASE_URL: the live status page (live location, drone feed,
-# "Call Police" button) is NOT built yet -- it is a later, separate phase.
+# STATUS_PAGE_BASE_URL: the live status page ITSELF (the frontend -- live
+# location, drone feed, "Call Police" button) is NOT built yet -- it is a
+# later, separate phase. Its backend now exists: the
+# get_sos_incident_status(p_command_id) Postgres function (see
+# supabase/migrations/20260918120000_public_sos_status.sql), callable with no
+# login via the anon/publishable key, narrowly scoped to one command id --
+# whatever gets deployed at this URL should call that, not the raw tables.
 # The default below is deliberately an obviously-fake placeholder so nothing
-# breaks before that page exists; the WhatsApp message body just carries
-# f"{STATUS_PAGE_BASE_URL}/{mission_id}".
+# breaks before that frontend exists; set this to the real deployed URL once
+# it does (there is no further code change needed here when that happens --
+# just this value). The WhatsApp message body carries
+# f"{STATUS_PAGE_BASE_URL}/{command_id}" -- the CLAIMED COMMAND's id, not a
+# mission id: gss/alerts.py fires before any mission exists (see its module
+# docstring), so a mission id is not something that reliably exists yet.
 ALERTS_ENABLED: bool = _get_bool("ALERTS_ENABLED", True)
 STATUS_PAGE_BASE_URL: str = _get_str(
     "STATUS_PAGE_BASE_URL", "http://TODO-status-page.example"
@@ -554,6 +572,12 @@ def _validate() -> None:
     if LOG_LEVEL not in _VALID_LOG_LEVELS:
         errors.append(
             f"LOG_LEVEL must be one of {sorted(_VALID_LOG_LEVELS)}, got {LOG_LEVEL!r}"
+        )
+    if LOG_FILE_MAX_BYTES <= 0:
+        errors.append(f"LOG_FILE_MAX_BYTES must be positive, got {LOG_FILE_MAX_BYTES}")
+    if LOG_FILE_BACKUP_COUNT < 0:
+        errors.append(
+            f"LOG_FILE_BACKUP_COUNT must not be negative, got {LOG_FILE_BACKUP_COUNT}"
         )
 
     if not MAVLINK_CONNECTION:

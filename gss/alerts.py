@@ -104,12 +104,19 @@ class AlertSender:
         self._template_name = template_name or config.WABA_TEMPLATE_NAME or None
         self._template_lang = template_lang or config.WABA_TEMPLATE_LANG or "en"
 
-    def send(self, mission_id: str | None) -> None:
-        """Send the SOS WhatsApp alert for ``mission_id`` (may be ``None`` if
-        mission creation failed -- the alert still goes out) and write the
-        resulting ``alerts`` row. Never raises."""
+    def send(self, command_id: str) -> None:
+        """Send the SOS WhatsApp alert for the claimed ``sos`` command
+        ``command_id`` and write the resulting ``alerts`` row. Never raises.
+
+        Takes the COMMAND's id, not a mission id: this fires from
+        :meth:`gss.commands.CommandIntake._process` the moment the command is
+        claimed, before ``_validate_flight`` runs -- no mission exists yet,
+        may never exist at all (a rejected command), and the status page link
+        cannot wait for one. ``command_id`` always exists by this point (the
+        claim already returned it), unlike a mission id.
+        """
         try:
-            self._send(mission_id)
+            self._send(command_id)
         except Exception:
             # Every expected failure mode (no contacts, a per-recipient
             # exception, an unreachable store) is already handled inside
@@ -117,16 +124,16 @@ class AlertSender:
             # method itself is broken -- still must not crash the caller,
             # and the incident still must not go unrecorded.
             log.exception(
-                "alerts: send(mission_id=%s) hit an unexpected internal error "
+                "alerts: send(command_id=%s) hit an unexpected internal error "
                 "-- writing a failed alerts row so the failure is not silent",
-                mission_id,
+                command_id,
             )
             self._write_alert(
-                mission_id, status="failed", contacts_notified=None,
+                command_id, status="failed", contacts_notified=None,
                 error_detail="internal error in AlertSender.send() -- see the GSS log",
             )
 
-    def _send(self, mission_id: str | None) -> None:
+    def _send(self, command_id: str) -> None:
         contacts = self._store.get_active_contacts()
         if not contacts:
             # R10: an unreachable store already logged why and returned an
@@ -134,16 +141,19 @@ class AlertSender:
             # guishable here from "no contacts configured", and both are
             # "nothing to send", never a crash.
             log.warning(
-                "sos: no active contacts configured -- mission %s, nobody notified",
-                mission_id,
+                "sos: no active contacts configured -- command %s, nobody notified",
+                command_id,
             )
             self._write_alert(
-                mission_id, status="failed", contacts_notified=[],
+                command_id, status="failed", contacts_notified=[],
                 error_detail="no active contacts configured",
             )
             return
 
-        status_page_url = f"{config.STATUS_PAGE_BASE_URL}/{mission_id}"
+        # {STATUS_PAGE_BASE_URL}/{command_id} -- the command id, not a
+        # mission id (see send()'s docstring): it is the only identifier that
+        # reliably exists at this point, dispatched or not.
+        status_page_url = f"{config.STATUS_PAGE_BASE_URL}/{command_id}"
         payload = build_alert_payload(contacts, status_page_url, config.SOS_PERSON_NAME)
 
         notified: list[dict] = []
@@ -169,14 +179,14 @@ class AlertSender:
             )
 
         self._write_alert(
-            mission_id, status=status,
+            command_id, status=status,
             contacts_notified=notified + failed,
             error_detail=error_detail,
         )
         log.log(
             logging.INFO if status == "sent" else logging.WARNING,
-            "sos: WhatsApp alert %s -- mission %s, %d/%d recipient(s) notified",
-            status, mission_id, len(notified), len(notified) + len(failed),
+            "sos: WhatsApp alert %s -- command %s, %d/%d recipient(s) notified",
+            status, command_id, len(notified), len(notified) + len(failed),
         )
 
     def _send_one(self, recipient: dict, template_variables: dict) -> tuple[bool, str]:
@@ -259,17 +269,25 @@ class AlertSender:
 
     def _write_alert(
         self,
-        mission_id: str | None,
+        command_id: str,
         *,
         status: str,
         contacts_notified: list | None,
         error_detail: str | None,
     ) -> None:
+        # mission_id is always None here -- no mission exists yet at
+        # send-time (see send()'s docstring). command_id goes into `detail`
+        # instead, the one column store.create_alert already exposes for
+        # exactly this kind of auxiliary, non-FK bookkeeping (weather.py's
+        # emergency-refusal alerts use the same column) -- so this row can
+        # still be traced back to its command without needing a schema
+        # change or violating alerts.mission_id's FK to missions(id).
         self._store.create_alert(
-            mission_id=mission_id,
+            mission_id=None,
             channel="whatsapp",
             status=status,
             template_name=self._template_name,
+            detail={"command_id": command_id},
             contacts_notified=contacts_notified,
             error_detail=error_detail,
         )

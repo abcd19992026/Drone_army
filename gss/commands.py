@@ -590,10 +590,11 @@ class CommandIntake:
             # mission / safety.py's veto get any say). PROJECT.md Section 13
             # is explicit that none of those may ever stop this alert; only
             # whether the DRONE launches is theirs to decide, not whether the
-            # humans get notified. mission_id is unknown at this point (a
-            # mission, if any, is created later in _accept_flight) -- None is
-            # the same "no mission yet" case _fire_sos_alert already handles.
-            self._fire_sos_alert(None)
+            # humans get notified. Pass command_id, not a mission id -- no
+            # mission exists yet (one is created later in _accept_flight,
+            # only if validation passes) and the status-page link needs an
+            # identifier that exists right now regardless of that outcome.
+            self._fire_sos_alert(command_id)
 
         if ctype == "abort":
             self._handle_abort(cmd, server_now)
@@ -777,7 +778,7 @@ class CommandIntake:
             command_id, mission_id, mission_type,
         )
 
-    def _fire_sos_alert(self, mission_id: str | None) -> None:
+    def _fire_sos_alert(self, command_id: str) -> None:
         """Fire the WhatsApp SOS alert (Phase 11 -- gss/alerts.py).
 
         Called from :meth:`_process` the moment an "sos" command is claimed,
@@ -788,10 +789,12 @@ class CommandIntake:
         WhatsApp API must never block or delay validation/dispatch (its own
         R10 boundary lives in gss/alerts.py; this try/except is a second,
         redundant backstop since AlertSender.send() is documented to never
-        raise). ``mission_id`` is always ``None`` here -- at this point in
-        ``_process`` no mission has been created yet (that happens later, in
-        ``_accept_flight``, only if validation passes) -- the alerts.mission_id
-        column is nullable and the alert does not wait on it.
+        raise). ``command_id``, not a mission id: no mission has been created
+        yet at this point in ``_process`` (that happens later, in
+        ``_accept_flight``, only if validation passes) -- the status page
+        link (``{{2}}`` in the template) is built from this id instead, since
+        it is the one identifier guaranteed to exist regardless of that
+        outcome.
 
         A no-op (``gss.alerts`` is never imported) when ALERTS_ENABLED is
         false.
@@ -801,7 +804,7 @@ class CommandIntake:
         try:
             from gss.alerts import AlertSender
 
-            AlertSender(self._store).send(mission_id)
+            AlertSender(self._store).send(command_id)
         except Exception:
             log.exception(
                 "sos: alert send raised (mission dispatch is unaffected) -- "

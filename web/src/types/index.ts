@@ -216,3 +216,27 @@ export interface PatrolScheduleFormData {
 
 export type ActiveScreen = 'status' | 'map' | 'commands' | 'missions' | 'schedules' | 'alerts';
 
+export type SosPlainStatus =
+  | 'dispatched'
+  | 'enroute'
+  | 'returned'
+  | 'not_dispatched'
+  | 'expired';
+
+export interface SosRecentLocation {
+  lat: number;
+  lon: number;
+  accuracy_m?: number | null;
+  recorded_at?: string;
+}
+
+export interface SosIncidentStatus {
+  command_id: string;
+  command_status: string;
+  command_created_at: string;
+  plain_status: SosPlainStatus;
+  reason: string | null;
+  mission_id: string | null;
+  recent_locations: SosRecentLocation[];
+}
+

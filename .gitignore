@@ -69,3 +69,7 @@ supabase/.temp/
 # safe-spot list cache (v0.5.1) -- last known safe spots for offline boot
 .safe_spots_cache.json
 .safe_spots_*.tmp
+
+# GSS rotating log file (gss/main.py, LOG_FILE_PATH)
+gss.log
+gss.log.*

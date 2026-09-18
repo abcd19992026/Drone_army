@@ -85,16 +85,38 @@ def test_1_active_contacts_success_writes_sent():
     sender = AlertSender(store)
 
     with patch.object(AlertSender, "_send_one", return_value=(True, "delivered")):
-        sender.send("mission-1")
+        sender.send("cmd-1")
 
     store.create_alert.assert_called_once()
     kwargs = store.create_alert.call_args.kwargs
-    assert kwargs["mission_id"] == "mission-1"
+    # mission_id is always None -- no mission exists at send-time (see
+    # AlertSender.send's docstring); the command id is carried in `detail`
+    # instead, since alerts.mission_id has an FK to missions(id).
+    assert kwargs["mission_id"] is None
+    assert kwargs["detail"] == {"command_id": "cmd-1"}
     assert kwargs["channel"] == "whatsapp"
     assert kwargs["status"] == "sent"
     assert len(kwargs["contacts_notified"]) == 2
     assert all(c["delivered"] for c in kwargs["contacts_notified"])
     assert kwargs["error_detail"] is None
+
+
+def test_url_construction_uses_command_id_not_mission_id(monkeypatch):
+    monkeypatch.setattr(config, "STATUS_PAGE_BASE_URL", "http://status.example")
+    store = MagicMock()
+    store.get_active_contacts.return_value = [_contact()]
+    sender = AlertSender(store)
+
+    captured = {}
+
+    def fake_send_one(_self, _recipient, template_variables):
+        captured["status_page_url"] = template_variables["status_page_url"]
+        return True, "sent"
+
+    with patch.object(AlertSender, "_send_one", fake_send_one):
+        sender.send("cmd-xyz")
+
+    assert captured["status_page_url"] == "http://status.example/cmd-xyz"
 
 
 # ── 2: no active contacts -> 'failed', no API call, no exception ───────────
@@ -105,12 +127,13 @@ def test_2_no_active_contacts_writes_failed_no_api_call():
     sender = AlertSender(store)
 
     with patch.object(AlertSender, "_send_one") as send_one:
-        sender.send("mission-2")  # must not raise
+        sender.send("cmd-2")  # must not raise
 
     send_one.assert_not_called()
     kwargs = store.create_alert.call_args.kwargs
     assert kwargs["status"] == "failed"
-    assert kwargs["mission_id"] == "mission-2"
+    assert kwargs["mission_id"] is None
+    assert kwargs["detail"] == {"command_id": "cmd-2"}
     assert "no active contacts" in kwargs["error_detail"]
 
 
@@ -122,7 +145,7 @@ def test_3_api_raises_writes_failed_no_exception():
     sender = AlertSender(store)
 
     with patch.object(AlertSender, "_send_one", side_effect=TimeoutError("no response")):
-        sender.send("mission-3")  # must not raise
+        sender.send("cmd-3")  # must not raise
 
     kwargs = store.create_alert.call_args.kwargs
     assert kwargs["status"] == "failed"
@@ -145,7 +168,7 @@ def test_4_partial_delivery_writes_partial():
         return False, "recipient number not on WhatsApp"
 
     with patch.object(AlertSender, "_send_one", fake_send_one):
-        sender.send("mission-4")
+        sender.send("cmd-4")
 
     kwargs = store.create_alert.call_args.kwargs
     assert kwargs["status"] == "partial"
@@ -172,12 +195,12 @@ def test_end_to_end_sent_uses_configured_person_name_and_records_message_id(monk
         {"messages": [{"id": "wamid.END2END"}]}
     ).encode("utf-8")
     with patch("gss.alerts.urllib.request.urlopen", return_value=fake_resp) as urlopen:
-        sender.send("mission-e2e")
+        sender.send("cmd-e2e")
 
     body = json.loads(urlopen.call_args.args[0].data)
     params = body["template"]["components"][0]["parameters"]
     assert params[0]["text"] == "Raj"
-    assert params[1]["text"] == "http://status.example/mission-e2e"
+    assert params[1]["text"] == "http://status.example/cmd-e2e"
 
     kwargs = store.create_alert.call_args.kwargs
     assert kwargs["status"] == "sent"
@@ -197,7 +220,7 @@ def test_6_contacts_unreachable_treated_as_no_contacts():
     sender = AlertSender(store)
 
     with patch.object(AlertSender, "_send_one") as send_one:
-        sender.send("mission-6")  # must not raise
+        sender.send("cmd-6")  # must not raise
 
     send_one.assert_not_called()
     kwargs = store.create_alert.call_args.kwargs
@@ -209,7 +232,7 @@ def test_send_never_raises_even_on_a_totally_broken_store():
     store.get_active_contacts.side_effect = RuntimeError("boom")
     sender = AlertSender(store)
 
-    sender.send("mission-x")  # must not raise
+    sender.send("cmd-x")  # must not raise
 
     kwargs = store.create_alert.call_args.kwargs
     assert kwargs["status"] == "failed"
@@ -325,9 +348,10 @@ def test_send_one_returns_failure_on_http_error(monkeypatch):
 # call to _process(), immediately after the command is claimed and BEFORE
 # _validate_flight runs -- so every test below drives the real entry point,
 # intake._process(), not _accept_flight() directly (which no longer touches
-# alerts at all). mission_id is always None at fire time now: no mission
-# exists yet when the alert goes out, regardless of whether one gets created
-# a moment later.
+# alerts at all). AlertSender.send() is called with the COMMAND's id (not a
+# mission id -- see gss/alerts.py's send() docstring): no mission exists yet
+# when the alert goes out, regardless of whether one gets created a moment
+# later, so the status-page link uses the one identifier guaranteed to exist.
 
 def _sos_cmd(command_id=None):
     now = datetime.now(timezone.utc)
@@ -369,8 +393,9 @@ def test_9a_claimed_sos_row_reaches_alertsender_when_validation_passes(monkeypat
 
     safety.evaluate_command.assert_called_once()
     store.create_mission.assert_called_once()
-    # fired before the mission exists -- always None, even on the accepted path
-    sender_cls.return_value.send.assert_called_once_with(None)
+    # fired with the command id, before the mission exists -- even on the
+    # accepted path, since it fires from _process(), not _accept_flight()
+    sender_cls.return_value.send.assert_called_once_with(cmd["id"])
     start_executor.assert_called_once()
 
 
@@ -392,7 +417,7 @@ def test_9b_safety_veto_rejects_the_mission_but_alert_still_sent(monkeypatch):
     with patch("gss.alerts.AlertSender") as sender_cls:
         intake._process(cmd["id"], _Box())
 
-    sender_cls.return_value.send.assert_called_once_with(None)
+    sender_cls.return_value.send.assert_called_once_with(cmd["id"])
     store.create_mission.assert_not_called()
     store.update_command_status.assert_called_once()
     assert store.update_command_status.call_args.args[1] == "rejected"
@@ -410,7 +435,7 @@ def test_9c_alert_still_sent_when_geofence_rejects(monkeypatch):
     with patch("gss.alerts.AlertSender") as sender_cls:
         intake._process(cmd["id"], _Box())
 
-    sender_cls.return_value.send.assert_called_once_with(None)
+    sender_cls.return_value.send.assert_called_once_with(cmd["id"])
     store.create_mission.assert_not_called()
     assert store.update_command_status.call_args.args[1] == "rejected"
 
@@ -427,7 +452,7 @@ def test_9d_alert_still_sent_when_telemetry_is_stale(monkeypatch):
     with patch("gss.alerts.AlertSender") as sender_cls:
         intake._process(cmd["id"], _Box())
 
-    sender_cls.return_value.send.assert_called_once_with(None)
+    sender_cls.return_value.send.assert_called_once_with(cmd["id"])
     store.create_mission.assert_not_called()
     assert store.update_command_status.call_args.args[1] == "rejected"
 
@@ -450,7 +475,7 @@ def test_5a_alert_send_raises_validation_and_mission_still_proceed(monkeypatch):
         sender_cls.return_value.send.side_effect = RuntimeError("whatsapp down")
         intake._process(cmd["id"], _Box())  # must not raise
 
-    sender_cls.return_value.send.assert_called_once_with(None)
+    sender_cls.return_value.send.assert_called_once_with(cmd["id"])
     store.create_mission.assert_called_once()
     store.link_command_to_mission.assert_called_once_with(cmd["id"], "mission-5a")
     start_executor.assert_called_once()
@@ -471,7 +496,7 @@ def test_5b_mission_creation_fails_alert_was_already_sent(monkeypatch):
 
     # fired once, at claim time -- a later mission-creation failure does not
     # trigger (or need) a second attempt
-    sender_cls.return_value.send.assert_called_once_with(None)
+    sender_cls.return_value.send.assert_called_once_with(cmd["id"])
     store.update_command_status.assert_called_once_with(
         cmd["id"], "rejected",
         rejected_reason="internal error: could not create the mission",
@@ -507,3 +532,50 @@ def test_8b_alerts_disabled_never_calls_create_alert_mission_unaffected(monkeypa
     store.create_alert.assert_not_called()
     store.create_mission.assert_called_once()
     start_executor.assert_called_once()
+
+
+# ── 10: alerts.mission_id must stay nullable in the schema ─────────────────
+#
+# Bug-hunt regression guard. AlertSender._send() (gss/alerts.py) now always
+# writes its `alerts` row before a mission may even exist -- mission_id=None
+# is a legitimate, PERMANENT state, not a transient one, for every "sos"
+# command from now on. Confirmed directly against the live Supabase project
+# during the investigation into a reported "internal error while handling
+# the command" crash (a real INSERT with mission_id=null succeeded; the
+# crash traced to a since-stopped stale process running pre-fix code, not to
+# a schema constraint -- see PROJECT.md/commit history for the writeup).
+# This test cannot exercise the live database (these tests run with
+# SUPABASE_ENABLED=false, no real Supabase credentials required) -- so
+# instead it guards the migration FILES: a future migration that adds
+# `NOT NULL` back onto `alerts.mission_id` would only ever surface as a
+# production write failure, silently, since no local test touches the real
+# schema. This makes that mistake fail here first.
+
+import pathlib
+import re
+
+_MIGRATIONS_DIR = pathlib.Path(__file__).resolve().parent.parent / "supabase" / "migrations"
+
+
+def _all_migrations_sql() -> str:
+    paths = sorted(_MIGRATIONS_DIR.glob("*.sql"))
+    assert paths, f"no migration files found under {_MIGRATIONS_DIR}"
+    return "\n".join(p.read_text(encoding="utf-8") for p in paths)
+
+
+def test_10_no_migration_makes_alerts_mission_id_not_null():
+    """Line-by-line, not whole-statement: a CREATE TABLE (or ALTER TABLE)
+    statement mentioning "alerts" also legitimately contains "not null" for
+    OTHER columns (e.g. triggered_at) -- only a line that names mission_id
+    specifically, alongside "not null", is the thing to catch. Covers both
+    the original create-table definition and any later ALTER TABLE."""
+    sql = _all_migrations_sql()
+    for stmt in re.split(r";", sql):
+        if "alerts" not in stmt.lower() or "mission_id" not in stmt.lower():
+            continue
+        for line in stmt.splitlines():
+            if re.search(r"\bmission_id\b", line, re.IGNORECASE):
+                assert not re.search(r"not\s+null", line, re.IGNORECASE), (
+                    f"a migration line makes alerts.mission_id NOT NULL: "
+                    f"{line.strip()!r}"
+                )

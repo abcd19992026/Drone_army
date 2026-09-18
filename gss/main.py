@@ -20,6 +20,7 @@ is byte-for-byte unchanged.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
 import threading
 import time
@@ -39,11 +40,30 @@ _RECOVERY_TELEMETRY_GRACE_S = 5.0
 
 
 def _configure_logging() -> None:
-    """Set up timestamped logging at the configured level."""
+    """Set up timestamped logging at the configured level -- console always,
+    plus a rotating file (``LOG_FILE_PATH``, empty disables it) so a crash
+    traceback survives an unattended run instead of only ever reaching a
+    console nobody is watching. This is exactly the gap that made a real
+    "internal error while handling the command" report undiagnosable after
+    the fact: the process that hit it had logged the full traceback (every
+    catch-all in this codebase uses ``log.exception``, which always includes
+    one) to a console whose output was never captured anywhere."""
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if config.LOG_FILE_PATH:
+        handlers.append(
+            logging.handlers.RotatingFileHandler(
+                config.LOG_FILE_PATH,
+                maxBytes=config.LOG_FILE_MAX_BYTES,
+                backupCount=config.LOG_FILE_BACKUP_COUNT,
+            )
+        )
+    for handler in handlers:
+        handler.setFormatter(fmt)
     logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL, logging.INFO),
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        level=getattr(logging, config.LOG_LEVEL, logging.INFO), handlers=handlers,
     )
 
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useAuth } from './context/AuthContext';
 import { Header } from './components/Header';
 import { Navigation } from './components/Navigation';
@@ -9,6 +9,7 @@ import { CommandsScreen } from './screens/CommandsScreen';
 import { MissionHistoryScreen } from './screens/MissionHistoryScreen';
 import { PatrolSchedulesScreen } from './screens/PatrolSchedulesScreen';
 import { AlertsScreen } from './screens/AlertsScreen';
+import { PublicSosStatusScreen } from './screens/PublicSosStatusScreen';
 import { useDroneRealtime } from './hooks/useDroneRealtime';
 import { useCommands } from './hooks/useCommands';
 import { useMissions } from './hooks/useMissions';
@@ -17,9 +18,61 @@ import { useAlerts } from './hooks/useAlerts';
 import type { ActiveScreen } from './types';
 import { Radio } from 'lucide-react';
 
+function getSosCommandIdFromUrl(): string | null {
+  if (typeof window === 'undefined') return null;
+
+  // 1. Path: /status/:id or /status/:id/
+  const pathname = window.location.pathname;
+  const statusMatch = pathname.match(/^\/status\/([a-zA-Z0-9_-]+)/i);
+  if (statusMatch && statusMatch[1]) {
+    return statusMatch[1];
+  }
+
+  // 2. Direct UUID path: /<uuid>
+  const uuidMatch = pathname.match(/^\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  if (uuidMatch && uuidMatch[1]) {
+    return uuidMatch[1];
+  }
+
+  // 3. Hash: #/status/:id or #/status/<uuid>
+  const hash = window.location.hash;
+  const hashMatch = hash.match(/^#\/?status\/([a-zA-Z0-9_-]+)/i);
+  if (hashMatch && hashMatch[1]) {
+    return hashMatch[1];
+  }
+
+  // 4. Query param: ?status=:id or ?command_id=:id or ?commandId=:id
+  const searchParams = new URLSearchParams(window.location.search);
+  const paramId = searchParams.get('command_id') || searchParams.get('commandId') || searchParams.get('status');
+  if (paramId) {
+    return paramId;
+  }
+
+  return null;
+}
+
 export const App: React.FC = () => {
+  const [publicSosCommandId, setPublicSosCommandId] = useState<string | null>(() => getSosCommandIdFromUrl());
+
+  useEffect(() => {
+    const handleUrlChange = () => {
+      setPublicSosCommandId(getSosCommandIdFromUrl());
+    };
+    window.addEventListener('popstate', handleUrlChange);
+    window.addEventListener('hashchange', handleUrlChange);
+    return () => {
+      window.removeEventListener('popstate', handleUrlChange);
+      window.removeEventListener('hashchange', handleUrlChange);
+    };
+  }, []);
+
   const { user, loading: authLoading } = useAuth();
   const [activeScreen, setActiveScreen] = useState<ActiveScreen>('status');
+
+  // 1. Public SOS Status Route (NO LOGIN REQUIRED)
+  if (publicSosCommandId) {
+    return <PublicSosStatusScreen commandId={publicSosCommandId} />;
+  }
 
   // Ground Station Hooks
   const { drone, dock, isStale, staleSeconds, isLinkDown } = useDroneRealtime();
@@ -52,7 +105,7 @@ export const App: React.FC = () => {
 
   const { alerts, loading: alertsLoading } = useAlerts();
 
-  // 1. Loading state for initial session check
+  // 2. Loading state for initial session check
   if (authLoading) {
     return (
       <div className="min-h-screen bg-bg flex flex-col items-center justify-center text-tactical-cyan">
@@ -67,7 +120,7 @@ export const App: React.FC = () => {
     );
   }
 
-  // 2. Auth Guard: Not logged in
+  // 3. Auth Guard: Not logged in
   if (!user) {
     return <LoginScreen />;
   }
