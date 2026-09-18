@@ -63,10 +63,13 @@ def test_pure_build_alert_payload_shapes_recipients_and_drops_phoneless():
         _contact(contact_id="c1", name="Alice", phone="+1111"),
         {"id": "c2", "name": "No Phone", "phone": None, "priority": 50, "active": True},
     ]
-    payload = build_alert_payload(contacts, "http://status.example/m1")
+    payload = build_alert_payload(contacts, "http://status.example/m1", "Raj")
 
     assert payload["recipients"] == [{"contact_id": "c1", "name": "Alice", "phone": "+1111"}]
-    assert payload["template_variables"] == {"status_page_url": "http://status.example/m1"}
+    assert payload["template_variables"] == {
+        "person_name": "Raj",
+        "status_page_url": "http://status.example/m1",
+    }
 
 
 # ── 1: active contacts, API succeeds -> 'sent' ──────────────────────────────
@@ -148,6 +151,37 @@ def test_4_partial_delivery_writes_partial():
     assert "Bob" in kwargs["error_detail"]
 
 
+# ── end-to-end: real _send_one wired through _send, person_name from config ─
+
+def test_end_to_end_sent_uses_configured_person_name_and_records_message_id(monkeypatch):
+    monkeypatch.setattr(config, "WABA_PHONE_NUMBER_ID", "123")
+    monkeypatch.setattr(config, "WABA_ACCESS_TOKEN", "secret-token")
+    monkeypatch.setattr(config, "SOS_PERSON_NAME", "Raj")
+    monkeypatch.setattr(config, "STATUS_PAGE_BASE_URL", "http://status.example")
+
+    store = MagicMock()
+    store.get_active_contacts.return_value = [_contact(contact_id="c1", phone="+1111")]
+    sender = AlertSender(store, template_name="sos_alert")
+
+    fake_resp = MagicMock()
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.read.return_value = json.dumps(
+        {"messages": [{"id": "wamid.END2END"}]}
+    ).encode("utf-8")
+    with patch("gss.alerts.urllib.request.urlopen", return_value=fake_resp) as urlopen:
+        sender.send("mission-e2e")
+
+    body = json.loads(urlopen.call_args.args[0].data)
+    params = body["template"]["components"][0]["parameters"]
+    assert params[0]["text"] == "Raj"
+    assert params[1]["text"] == "http://status.example/mission-e2e"
+
+    kwargs = store.create_alert.call_args.kwargs
+    assert kwargs["status"] == "sent"
+    assert kwargs["contacts_notified"][0]["delivered"] is True
+    assert kwargs["contacts_notified"][0]["detail"] == "wamid.END2END"
+
+
 # ── 6: store.get_active_contacts() unreachable -> treated as no contacts ───
 
 def test_6_contacts_unreachable_treated_as_no_contacts():
@@ -183,9 +217,12 @@ def test_send_never_raises_even_on_a_totally_broken_store():
 def test_send_one_refuses_without_full_config(monkeypatch):
     monkeypatch.setattr(config, "WABA_PHONE_NUMBER_ID", "123")
     monkeypatch.setattr(config, "WABA_ACCESS_TOKEN", "")  # not set
-    sender = AlertSender(MagicMock(), template_name=None)  # no template either
+    monkeypatch.setattr(config, "WABA_TEMPLATE_NAME", "")  # not set either
+    sender = AlertSender(MagicMock(), template_name=None)  # no override
 
-    ok, detail = sender._send_one({"phone": "+1111"}, {"status_page_url": "http://x/m1"})
+    ok, detail = sender._send_one(
+        {"phone": "+1111"}, {"person_name": "Raj", "status_page_url": "http://x/m1"}
+    )
 
     assert ok is False
     assert "WABA_ACCESS_TOKEN" in detail
@@ -195,22 +232,64 @@ def test_send_one_refuses_without_full_config(monkeypatch):
 def test_send_one_posts_to_graph_api_when_fully_configured(monkeypatch):
     monkeypatch.setattr(config, "WABA_PHONE_NUMBER_ID", "123")
     monkeypatch.setattr(config, "WABA_ACCESS_TOKEN", "secret-token")
-    sender = AlertSender(MagicMock(), template_name="incident_alert")
+    sender = AlertSender(MagicMock(), template_name="sos_alert", template_lang="en")
+
+    fake_resp = MagicMock()
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.read.return_value = json.dumps(
+        {"messages": [{"id": "wamid.HBgABC123"}]}
+    ).encode("utf-8")
+    with patch("gss.alerts.urllib.request.urlopen", return_value=fake_resp) as urlopen:
+        ok, detail = sender._send_one(
+            {"phone": "+1111"}, {"person_name": "Raj", "status_page_url": "http://x/m1"}
+        )
+
+    assert ok is True
+    assert detail == "wamid.HBgABC123"
+    request = urlopen.call_args.args[0]
+    assert request.full_url == "https://graph.facebook.com/v25.0/123/messages"
+    assert request.get_header("Authorization") == "Bearer secret-token"
+    body = json.loads(request.data)
+    assert body["to"] == "+1111"
+    assert body["template"]["name"] == "sos_alert"
+    assert body["template"]["language"]["code"] == "en"
+    params = body["template"]["components"][0]["parameters"]
+    assert params[0]["text"] == "Raj"
+    assert params[1]["text"] == "http://x/m1"
+
+
+def test_send_one_falls_back_to_sent_when_response_has_no_message_id(monkeypatch):
+    monkeypatch.setattr(config, "WABA_PHONE_NUMBER_ID", "123")
+    monkeypatch.setattr(config, "WABA_ACCESS_TOKEN", "secret-token")
+    sender = AlertSender(MagicMock(), template_name="sos_alert")
+
+    fake_resp = MagicMock()
+    fake_resp.__enter__.return_value = fake_resp
+    fake_resp.read.return_value = b"not json"
+    with patch("gss.alerts.urllib.request.urlopen", return_value=fake_resp):
+        ok, detail = sender._send_one(
+            {"phone": "+1111"}, {"person_name": "Raj", "status_page_url": "http://x/m1"}
+        )
+
+    assert ok is True
+    assert detail == "sent"
+
+
+def test_send_one_uses_configured_template_lang(monkeypatch):
+    monkeypatch.setattr(config, "WABA_PHONE_NUMBER_ID", "123")
+    monkeypatch.setattr(config, "WABA_ACCESS_TOKEN", "secret-token")
+    sender = AlertSender(MagicMock(), template_name="sos_alert", template_lang="hi")
 
     fake_resp = MagicMock()
     fake_resp.__enter__.return_value = fake_resp
     fake_resp.read.return_value = b"{}"
     with patch("gss.alerts.urllib.request.urlopen", return_value=fake_resp) as urlopen:
-        ok, detail = sender._send_one({"phone": "+1111"}, {"status_page_url": "http://x/m1"})
+        sender._send_one(
+            {"phone": "+1111"}, {"person_name": "Raj", "status_page_url": "http://x/m1"}
+        )
 
-    assert ok is True
-    request = urlopen.call_args.args[0]
-    assert request.full_url == "https://graph.facebook.com/v21.0/123/messages"
-    assert request.get_header("Authorization") == "Bearer secret-token"
-    body = json.loads(request.data)
-    assert body["to"] == "+1111"
-    assert body["template"]["name"] == "incident_alert"
-    assert body["template"]["components"][0]["parameters"][0]["text"] == "http://x/m1"
+    body = json.loads(urlopen.call_args.args[0].data)
+    assert body["template"]["language"]["code"] == "hi"
 
 
 def test_send_one_returns_failure_on_http_error(monkeypatch):
@@ -218,16 +297,19 @@ def test_send_one_returns_failure_on_http_error(monkeypatch):
 
     monkeypatch.setattr(config, "WABA_PHONE_NUMBER_ID", "123")
     monkeypatch.setattr(config, "WABA_ACCESS_TOKEN", "secret-token")
-    sender = AlertSender(MagicMock(), template_name="incident_alert")
+    sender = AlertSender(MagicMock(), template_name="sos_alert")
 
     exc = urllib.error.HTTPError(
         "http://x", 401, "Unauthorized", None, MagicMock(read=lambda: b"bad token")
     )
     with patch("gss.alerts.urllib.request.urlopen", side_effect=exc):
-        ok, detail = sender._send_one({"phone": "+1111"}, {"status_page_url": "http://x/m1"})
+        ok, detail = sender._send_one(
+            {"phone": "+1111"}, {"person_name": "Raj", "status_page_url": "http://x/m1"}
+        )
 
     assert ok is False
     assert "401" in detail
+    assert "bad token" in detail
 
 
 # ── 5: alert + flight dispatch are independent, both directions ────────────

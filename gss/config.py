@@ -390,14 +390,16 @@ MEDIA_ENABLED: bool = _get_bool("MEDIA_ENABLED", True)
 # The default below is deliberately an obviously-fake placeholder so nothing
 # breaks before that page exists; the WhatsApp message body just carries
 # f"{STATUS_PAGE_BASE_URL}/{mission_id}".
-#
-# WABA_* (WhatsApp Business API) credentials and the approved template name
-# are intentionally NOT defined here yet -- pending exact env var names /
-# template details from the operator's existing SmartDentist WABA setup.
 ALERTS_ENABLED: bool = _get_bool("ALERTS_ENABLED", True)
 STATUS_PAGE_BASE_URL: str = _get_str(
     "STATUS_PAGE_BASE_URL", "http://TODO-status-page.example"
 )
+# The sos_alert template's {{1}} -- this is a single-operator system (PROJECT.md
+# Section 13: "his" trusted contacts get alerted about him), so this is one
+# fixed name, not something recorded per-mission. Same obviously-fake-default
+# pattern as STATUS_PAGE_BASE_URL above: never silently send a real alert
+# quoting a placeholder name.
+SOS_PERSON_NAME: str = _get_str("SOS_PERSON_NAME", "TODO-set-SOS_PERSON_NAME")
 
 # WhatsApp Business Cloud API (Meta) -- a fresh "Drone Army Project" WABA,
 # separate from the operator's existing SmartDentist one. WABA_ID is mostly
@@ -415,10 +417,13 @@ STATUS_PAGE_BASE_URL: str = _get_str(
 WABA_ID: str = _get_str("WABA_ID", "")
 WABA_PHONE_NUMBER_ID: str = _get_str("WABA_PHONE_NUMBER_ID", "")
 WABA_ACCESS_TOKEN: str = _get_str("WABA_ACCESS_TOKEN", "")
-# No approved template yet. Left blank on purpose: gss/alerts.py's
-# AlertSender._send_one() checks for this and refuses to call the API (a
-# clear 'failed' alerts row, not a guessed request) until it is set.
+# sos_alert, approved 2026-09 as a UTILITY-category template (no CTA -- see
+# PROJECT.md Section 13 on why a CTA would get it reclassified as Marketing
+# at ~8x cost). Left blank by default: gss/alerts.py's AlertSender._send_one()
+# checks for this and refuses to call the API (a clear 'failed' alerts row,
+# not a guessed request) until it is set.
 WABA_TEMPLATE_NAME: str = _get_str("WABA_TEMPLATE_NAME", "")
+WABA_TEMPLATE_LANG: str = _get_str("WABA_TEMPLATE_LANG", "en")
 
 # --- gss/beacon.py (Phase 12): find-my-drone beacon -------------------------
 # Spotlight + siren on link loss, purely time-based (see that module's
@@ -775,6 +780,10 @@ def _validate() -> None:
     # --- alerts.py (Phase 11) ---
     if not STATUS_PAGE_BASE_URL:
         errors.append("STATUS_PAGE_BASE_URL must not be empty")
+    if not SOS_PERSON_NAME:
+        errors.append("SOS_PERSON_NAME must not be empty")
+    if not WABA_TEMPLATE_LANG:
+        errors.append("WABA_TEMPLATE_LANG must not be empty")
 
     # --- beacon.py (Phase 12) ---
     for _name, _value in (

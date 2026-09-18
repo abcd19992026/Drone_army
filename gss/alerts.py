@@ -26,18 +26,16 @@ ordinary per-request HTTP timeout, or leave the incident unrecorded. Every
 path through ``send()`` ends with exactly one ``alerts`` row written, whether
 that is 'sent', 'partial', or 'failed'.
 
-CONFIG NOTE: WABA_ID / WABA_PHONE_NUMBER_ID are configured (a fresh "Drone
-Army Project" Meta app, separate from the operator's SmartDentist one -- see
-gss/config.py), and :meth:`AlertSender._send_one` makes a real Meta Cloud API
-call. It still REFUSES to call the API (writing a clear 'failed' alerts row
-instead) until an approved UTILITY-category template (no CTA; a CTA gets a
-template reclassified as Marketing at ~8x cost -- PROJECT.md Section 13) is
-set as WABA_TEMPLATE_NAME. The single-body-variable (status page link)
-request shape is a reasonable default, not a confirmed one -- revisit it
-against the real template once it exists. Everything else in this module --
-the store read, the payload shape, the sent/partial/failed bookkeeping, and
-the never-blocks-never-crashes contract -- is real and covered by
-tests/test_alerts.py.
+CONFIG NOTE: the ``sos_alert`` template (UTILITY category, no CTA -- a CTA
+gets a template reclassified as Marketing at ~8x cost, PROJECT.md Section 13)
+is now APPROVED on Meta, and :meth:`AlertSender._send_one` makes the real
+Meta Cloud API call: two body variables, {{1}} the name of the person the
+alert is about (``config.SOS_PERSON_NAME`` -- this is a single-operator
+system, so it is one fixed name, not per-mission data) and {{2}} the live
+status page link. It still REFUSES to call the API (writing a clear 'failed'
+alerts row instead) if ``WABA_PHONE_NUMBER_ID``, ``WABA_ACCESS_TOKEN`` or
+``WABA_TEMPLATE_NAME`` is ever unset -- an unconfigured alert channel must
+stay visible, never silently pretend to succeed.
 """
 
 from __future__ import annotations
@@ -57,12 +55,13 @@ log = logging.getLogger(__name__)
 # ===========================================================================
 
 
-def build_alert_payload(contacts: list[dict], status_page_url: str) -> dict:
+def build_alert_payload(contacts: list[dict], status_page_url: str, person_name: str) -> dict:
     """Pure. Active contacts (already sorted by priority, highest first --
-    :meth:`~gss.store.TelemetryStore.get_active_contacts`'s own ordering) and
-    the live-status-page URL -> the WhatsApp template payload: one recipient
-    per contact with a phone number, plus the template variables every
-    recipient's message shares. No network, no I/O.
+    :meth:`~gss.store.TelemetryStore.get_active_contacts`'s own ordering), the
+    live-status-page URL, and the name of the person the alert is about ->
+    the WhatsApp template payload: one recipient per contact with a phone
+    number, plus the template variables every recipient's message shares. No
+    network, no I/O.
 
     Contacts with no phone number are silently dropped here rather than
     failed later against the WhatsApp API -- there is nothing to send them.
@@ -74,7 +73,10 @@ def build_alert_payload(contacts: list[dict], status_page_url: str) -> dict:
     ]
     return {
         "recipients": recipients,
-        "template_variables": {"status_page_url": status_page_url},
+        "template_variables": {
+            "person_name": person_name,
+            "status_page_url": status_page_url,
+        },
     }
 
 
@@ -92,9 +94,12 @@ class AlertSender:
     completely independent of that same command's flight dispatch.
     """
 
-    def __init__(self, store, *, template_name: str | None = None) -> None:
+    def __init__(
+        self, store, *, template_name: str | None = None, template_lang: str | None = None
+    ) -> None:
         self._store = store
         self._template_name = template_name or config.WABA_TEMPLATE_NAME or None
+        self._template_lang = template_lang or config.WABA_TEMPLATE_LANG or "en"
 
     def send(self, mission_id: str | None) -> None:
         """Send the SOS WhatsApp alert for ``mission_id`` (may be ``None`` if
@@ -136,7 +141,7 @@ class AlertSender:
             return
 
         status_page_url = f"{config.STATUS_PAGE_BASE_URL}/{mission_id}"
-        payload = build_alert_payload(contacts, status_page_url)
+        payload = build_alert_payload(contacts, status_page_url, config.SOS_PERSON_NAME)
 
         notified: list[dict] = []
         failed: list[dict] = []
@@ -180,18 +185,14 @@ class AlertSender:
 
         Refuses to call the API at all -- and returns a clear failure
         instead -- unless ``WABA_PHONE_NUMBER_ID``, ``WABA_ACCESS_TOKEN`` and
-        an approved ``WABA_TEMPLATE_NAME`` are ALL configured. No template is
-        approved yet, so this always takes that path today -- which is the
-        correct, safe state: an unconfigured alert channel must be visible (a
-        'failed' alerts row with a clear error_detail), never silently
-        pretend to succeed or send a request built around a guessed
-        template.
+        ``WABA_TEMPLATE_NAME`` are ALL configured: an unconfigured alert
+        channel must be visible (a 'failed' alerts row with a clear
+        error_detail), never silently pretend to succeed or send a request
+        built around a guessed template.
 
-        TODO(Phase 11 follow-up): once WABA_TEMPLATE_NAME is approved,
-        confirm its exact variable count/order actually matches the
-        single-body-variable (the status page link) assumption below --
-        adjust ``components`` if the real template differs (a header image,
-        more than one body variable, a non-en_US language, etc).
+        The ``sos_alert`` template (approved 2026-09) takes two body
+        variables in order: {{1}} the name of the person the alert is about,
+        {{2}} the live status page link.
         """
         missing = [
             name for name, value in (
@@ -204,17 +205,18 @@ class AlertSender:
         if missing:
             return False, f"WhatsApp not configured yet ({', '.join(missing)} unset)"
 
-        url = f"https://graph.facebook.com/v21.0/{config.WABA_PHONE_NUMBER_ID}/messages"
+        url = f"https://graph.facebook.com/v25.0/{config.WABA_PHONE_NUMBER_ID}/messages"
         body = {
             "messaging_product": "whatsapp",
             "to": recipient.get("phone"),
             "type": "template",
             "template": {
                 "name": self._template_name,
-                "language": {"code": "en_US"},
+                "language": {"code": self._template_lang},
                 "components": [{
                     "type": "body",
                     "parameters": [
+                        {"type": "text", "text": template_variables["person_name"]},
                         {"type": "text", "text": template_variables["status_page_url"]},
                     ],
                 }],
@@ -231,12 +233,25 @@ class AlertSender:
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as resp:
-                resp.read()
-                return True, "sent"
+                resp_body = resp.read()
+            message_id = None
+            try:
+                message_id = json.loads(resp_body)["messages"][0]["id"]
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                pass
+            return True, message_id or "sent"
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")[:300]
+            log.warning(
+                "sos: WhatsApp send to %s failed: HTTP %d: %s",
+                recipient.get("phone"), exc.code, detail,
+            )
             return False, f"HTTP {exc.code}: {detail}"
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            log.warning(
+                "sos: WhatsApp send to %s failed: %s: %s",
+                recipient.get("phone"), type(exc).__name__, exc,
+            )
             return False, f"{type(exc).__name__}: {exc}"
 
     def _write_alert(
