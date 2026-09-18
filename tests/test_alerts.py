@@ -34,6 +34,8 @@ import inspect
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("SUPABASE_ENABLED", "false")
@@ -42,7 +44,8 @@ os.environ.setdefault("MEDIA_ENABLED", "false")
 
 from gss import config
 from gss.alerts import AlertSender, build_alert_payload
-from gss.commands import CommandIntake
+from gss.commands import CommandIntake, _Box
+from gss.safety import SafetyAction
 
 
 def _cid() -> str:
@@ -312,47 +315,163 @@ def test_send_one_returns_failure_on_http_error(monkeypatch):
     assert "bad token" in detail
 
 
-# ── 5: alert + flight dispatch are independent, both directions ────────────
+# ── 5/9: the full pipeline, a raw commands row -> AlertSender.send ─────────
+#
+# Bug fix: _fire_sos_alert used to run inside _accept_flight, AFTER
+# _validate_flight had already accepted the command -- so a geofence
+# rejection, stale telemetry, a conflicting active mission, or a safety.py
+# veto meant the alert never fired at all. That contradicted PROJECT.md
+# Section 13 ("none of that may ever stop this alert"). The fix moved the
+# call to _process(), immediately after the command is claimed and BEFORE
+# _validate_flight runs -- so every test below drives the real entry point,
+# intake._process(), not _accept_flight() directly (which no longer touches
+# alerts at all). mission_id is always None at fire time now: no mission
+# exists yet when the alert goes out, regardless of whether one gets created
+# a moment later.
 
 def _sos_cmd(command_id=None):
+    now = datetime.now(timezone.utc)
     return {
         "id": command_id or _cid(), "type": "sos",
         "target_lat": 25.60, "target_lon": 85.21, "target_alt_m": 30.0,
         "issued_by": "phone", "params": {},
+        "issued_at": now.isoformat(),
+        "expires_at": (now + timedelta(minutes=5)).isoformat(),
     }
 
 
-def test_5a_alert_send_raises_mission_creation_still_happens(monkeypatch):
+def _claim(cmd):
+    return (True, {"command": cmd, "server_now": datetime.now(timezone.utc).isoformat()})
+
+
+def _allow_safety():
+    safety = MagicMock()
+    safety.evaluate_command.return_value = SimpleNamespace(action=SafetyAction.ALLOW, reasons=())
+    return safety
+
+
+_OK_SNAPSHOT = SimpleNamespace(connected=True, telemetry_age_s=1.0)
+
+
+def test_9a_claimed_sos_row_reaches_alertsender_when_validation_passes(monkeypatch):
     monkeypatch.setattr(config, "ALERTS_ENABLED", True)
-    store = MagicMock()
-    store.create_mission.return_value = "mission-5a"
-    intake = CommandIntake(store, lambda: MagicMock(), realtime_enabled=False)
     cmd = _sos_cmd()
+
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    store.create_mission.return_value = "mission-9a"
+    safety = _allow_safety()
+    intake = CommandIntake(store, lambda: _OK_SNAPSHOT, realtime_enabled=False, safety=safety)
+
+    with patch.object(intake, "_start_executor") as start_executor, \
+         patch("gss.alerts.AlertSender") as sender_cls:
+        intake._process(cmd["id"], _Box())  # the real entry point, not _accept_flight
+
+    safety.evaluate_command.assert_called_once()
+    store.create_mission.assert_called_once()
+    # fired before the mission exists -- always None, even on the accepted path
+    sender_cls.return_value.send.assert_called_once_with(None)
+    start_executor.assert_called_once()
+
+
+def test_9b_safety_veto_rejects_the_mission_but_alert_still_sent(monkeypatch):
+    """The fix, locked in: a safety REJECT still stops the mission/flight --
+    that authority is untouched -- but the WhatsApp alert has already gone
+    out by the time _validate_flight even runs, so it is unaffected."""
+    monkeypatch.setattr(config, "ALERTS_ENABLED", True)
+    cmd = _sos_cmd()
+
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    safety = MagicMock()
+    safety.evaluate_command.return_value = SimpleNamespace(
+        action=SafetyAction.REJECT, reasons=("battery 12%",),
+    )
+    intake = CommandIntake(store, lambda: _OK_SNAPSHOT, realtime_enabled=False, safety=safety)
+
+    with patch("gss.alerts.AlertSender") as sender_cls:
+        intake._process(cmd["id"], _Box())
+
+    sender_cls.return_value.send.assert_called_once_with(None)
+    store.create_mission.assert_not_called()
+    store.update_command_status.assert_called_once()
+    assert store.update_command_status.call_args.args[1] == "rejected"
+
+
+def test_9c_alert_still_sent_when_geofence_rejects(monkeypatch):
+    monkeypatch.setattr(config, "ALERTS_ENABLED", True)
+    cmd = _sos_cmd()
+    cmd["target_lat"], cmd["target_lon"] = 30.0, 90.0  # far outside MAX_RADIUS_M
+
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    intake = CommandIntake(store, lambda: _OK_SNAPSHOT, realtime_enabled=False)
+
+    with patch("gss.alerts.AlertSender") as sender_cls:
+        intake._process(cmd["id"], _Box())
+
+    sender_cls.return_value.send.assert_called_once_with(None)
+    store.create_mission.assert_not_called()
+    assert store.update_command_status.call_args.args[1] == "rejected"
+
+
+def test_9d_alert_still_sent_when_telemetry_is_stale(monkeypatch):
+    monkeypatch.setattr(config, "ALERTS_ENABLED", True)
+    cmd = _sos_cmd()
+    stale_snapshot = SimpleNamespace(connected=True, telemetry_age_s=9999.0)
+
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    intake = CommandIntake(store, lambda: stale_snapshot, realtime_enabled=False)
+
+    with patch("gss.alerts.AlertSender") as sender_cls:
+        intake._process(cmd["id"], _Box())
+
+    sender_cls.return_value.send.assert_called_once_with(None)
+    store.create_mission.assert_not_called()
+    assert store.update_command_status.call_args.args[1] == "rejected"
+
+
+def test_5a_alert_send_raises_validation_and_mission_still_proceed(monkeypatch):
+    """The alert path is caught inside _fire_sos_alert itself -- this proves
+    that even so, _process() carries on through validation and acceptance
+    rather than dying partway (independence holds in both directions)."""
+    monkeypatch.setattr(config, "ALERTS_ENABLED", True)
+    cmd = _sos_cmd()
+
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    store.create_mission.return_value = "mission-5a"
+    safety = _allow_safety()
+    intake = CommandIntake(store, lambda: _OK_SNAPSHOT, realtime_enabled=False, safety=safety)
 
     with patch.object(intake, "_start_executor") as start_executor, \
          patch("gss.alerts.AlertSender") as sender_cls:
         sender_cls.return_value.send.side_effect = RuntimeError("whatsapp down")
-        intake._accept_flight(cmd)  # must not raise
+        intake._process(cmd["id"], _Box())  # must not raise
 
+    sender_cls.return_value.send.assert_called_once_with(None)
     store.create_mission.assert_called_once()
     store.link_command_to_mission.assert_called_once_with(cmd["id"], "mission-5a")
     start_executor.assert_called_once()
-    sender_cls.return_value.send.assert_called_once_with("mission-5a")
 
 
-def test_5b_mission_creation_fails_alert_still_sends(monkeypatch):
+def test_5b_mission_creation_fails_alert_was_already_sent(monkeypatch):
     monkeypatch.setattr(config, "ALERTS_ENABLED", True)
-    store = MagicMock()
-    store.create_mission.return_value = None  # simulated failure
-    intake = CommandIntake(store, lambda: MagicMock(), realtime_enabled=False)
     cmd = _sos_cmd()
 
-    with patch("gss.alerts.AlertSender") as sender_cls:
-        intake._accept_flight(cmd)  # must not raise
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    store.create_mission.return_value = None  # simulated failure
+    safety = _allow_safety()
+    intake = CommandIntake(store, lambda: _OK_SNAPSHOT, realtime_enabled=False, safety=safety)
 
+    with patch("gss.alerts.AlertSender") as sender_cls:
+        intake._process(cmd["id"], _Box())  # must not raise
+
+    # fired once, at claim time -- a later mission-creation failure does not
+    # trigger (or need) a second attempt
     sender_cls.return_value.send.assert_called_once_with(None)
-    # the command is rejected because of the mission failure, independent of
-    # the alert outcome
     store.update_command_status.assert_called_once_with(
         cmd["id"], "rejected",
         rejected_reason="internal error: could not create the mission",
@@ -374,13 +493,16 @@ def test_8a_alerts_disabled_guard_precedes_the_import():
 
 def test_8b_alerts_disabled_never_calls_create_alert_mission_unaffected(monkeypatch):
     monkeypatch.setattr(config, "ALERTS_ENABLED", False)
-    store = MagicMock()
-    store.create_mission.return_value = "mission-8"
-    intake = CommandIntake(store, lambda: MagicMock(), realtime_enabled=False)
     cmd = _sos_cmd()
 
+    store = MagicMock()
+    store.claim_command.return_value = _claim(cmd)
+    store.create_mission.return_value = "mission-8"
+    safety = _allow_safety()
+    intake = CommandIntake(store, lambda: _OK_SNAPSHOT, realtime_enabled=False, safety=safety)
+
     with patch.object(intake, "_start_executor") as start_executor:
-        intake._accept_flight(cmd)
+        intake._process(cmd["id"], _Box())
 
     store.create_alert.assert_not_called()
     store.create_mission.assert_called_once()

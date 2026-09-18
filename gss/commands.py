@@ -109,7 +109,9 @@ def _mission_type_for(cmd: dict) -> str:
     location, standoff offset and all; see the is_summon wiring in
     gss/safety.py and gss/mission.py), only the record-keeping label differs.
     The WhatsApp alert that the same "sos" command also triggers is a
-    completely separate, unlinked action -- see _accept_flight below.
+    completely separate, unlinked action, fired earlier and unconditionally
+    in _process (before this mapping or any validation even runs) -- see
+    _fire_sos_alert.
     """
     ctype = cmd["type"]
     if ctype == "goto" and str(cmd.get("issued_by") or "").startswith(
@@ -581,6 +583,18 @@ class CommandIntake:
         ctype = cmd.get("type")
         log.info("claimed command %s (type=%s, issued_by=%s)", command_id, ctype, cmd.get("issued_by"))
 
+        if ctype == "sos":
+            # Phase 11 fix: fire the WhatsApp alert here, unconditionally, the
+            # moment the command is claimed -- BEFORE _validate_flight (and
+            # therefore before geofence / stale-telemetry / conflicting-
+            # mission / safety.py's veto get any say). PROJECT.md Section 13
+            # is explicit that none of those may ever stop this alert; only
+            # whether the DRONE launches is theirs to decide, not whether the
+            # humans get notified. mission_id is unknown at this point (a
+            # mission, if any, is created later in _accept_flight) -- None is
+            # the same "no mission yet" case _fire_sos_alert already handles.
+            self._fire_sos_alert(None)
+
         if ctype == "abort":
             self._handle_abort(cmd, server_now)
             return
@@ -726,16 +740,6 @@ class CommandIntake:
             triggered_by=cmd.get("issued_by") or "command",
         )
 
-        if cmd.get("type") == "sos":
-            # Phase 11: the WhatsApp alert and the flight dispatch are two
-            # INDEPENDENT outcomes of one "sos" command (PROJECT.md Section
-            # 13) -- fired here, right alongside mission creation, in its own
-            # try/except below. mission_id may be None if mission creation
-            # just failed above; the alert still goes out regardless, and a
-            # dead WhatsApp API must never delay or block the mission-reject
-            # path that follows.
-            self._fire_sos_alert(mission_id)
-
         if mission_id is None:
             log.error("command %s: could not create mission row; rejecting", command_id)
             self._reject(command_id, "internal error: could not create the mission")
@@ -776,14 +780,18 @@ class CommandIntake:
     def _fire_sos_alert(self, mission_id: str | None) -> None:
         """Fire the WhatsApp SOS alert (Phase 11 -- gss/alerts.py).
 
-        Genuinely independent of the flight dispatch: a geofence rejection, a
-        dead battery, bad weather -- none of that stops this from firing, and
-        conversely a dead WhatsApp API must never block or delay the drone
-        (its own R10 boundary lives in gss/alerts.py; this try/except is a
-        second, redundant backstop since AlertSender.send() is documented to
-        never raise). ``mission_id`` may be ``None`` if mission creation just
-        failed -- the alerts.mission_id column is nullable and the alert
-        still needs to go out.
+        Called from :meth:`_process` the moment an "sos" command is claimed,
+        BEFORE ``_validate_flight`` runs -- genuinely independent of the
+        flight dispatch: a geofence rejection, stale telemetry, a conflicting
+        active mission, bad weather, safety.py's veto -- none of that may
+        ever stop this alert (PROJECT.md Section 13), and conversely a dead
+        WhatsApp API must never block or delay validation/dispatch (its own
+        R10 boundary lives in gss/alerts.py; this try/except is a second,
+        redundant backstop since AlertSender.send() is documented to never
+        raise). ``mission_id`` is always ``None`` here -- at this point in
+        ``_process`` no mission has been created yet (that happens later, in
+        ``_accept_flight``, only if validation passes) -- the alerts.mission_id
+        column is nullable and the alert does not wait on it.
 
         A no-op (``gss.alerts`` is never imported) when ALERTS_ENABLED is
         false.

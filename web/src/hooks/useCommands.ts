@@ -81,14 +81,22 @@ export function useCommands(userEmail: string | null | undefined) {
       const { error } = await supabase.from('commands').insert(row);
 
       if (error) {
-        const errorMsg = `Command rejected: ${error.message}`;
+        const errorMsg =
+          type === 'sos'
+            ? `SOS dispatch failed: ${error.message}`
+            : `Command rejected: ${error.message}`;
         setStatusMessage({ text: errorMsg, type: 'error' });
         setIsSending(false);
         return { success: false, error: errorMsg };
       }
 
+      const successMsg =
+        type === 'sos'
+          ? '✓ SOS sent — drone and WhatsApp alert triggered'
+          : `✓ ${type.toUpperCase()} command queued! Awaiting GSS response...`;
+
       setStatusMessage({
-        text: `✓ ${type.toUpperCase()} command queued! Awaiting GSS response...`,
+        text: successMsg,
         type: 'success',
       });
       setIsSending(false);
@@ -96,9 +104,13 @@ export function useCommands(userEmail: string | null | undefined) {
       return { success: true };
     } catch (err: any) {
       const msg = err.message || 'Unknown network error';
-      setStatusMessage({ text: `Failed to issue command: ${msg}`, type: 'error' });
+      const errorMsg =
+        type === 'sos'
+          ? `SOS dispatch failed: ${msg}`
+          : `Failed to issue command: ${msg}`;
+      setStatusMessage({ text: errorMsg, type: 'error' });
       setIsSending(false);
-      return { success: false, error: msg };
+      return { success: false, error: errorMsg };
     }
   };
 

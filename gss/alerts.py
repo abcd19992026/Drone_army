@@ -3,11 +3,14 @@
 PROJECT.md Section 13: "in the first ~90 seconds of an incident, the
 phone/software does the real work" -- this module is that work's WhatsApp
 half. The other half is drone dispatch, and the two are DELIBERATELY
-UNLINKED: a geofence rejection, a dead battery, bad weather -- none of that
-may ever stop this alert from going out, and conversely a dead WhatsApp API
-must never stop or delay the drone. gss/commands.py's ``_fire_sos_alert``
-fires this from its own try/except, right alongside (not nested inside) the
-flight-mission code path, and neither call's outcome affects the other.
+UNLINKED: a geofence rejection, stale telemetry, a conflicting active
+mission, bad weather, safety.py's veto -- none of that may ever stop this
+alert from going out, and conversely a dead WhatsApp API must never stop or
+delay the drone. gss/commands.py's ``_fire_sos_alert`` fires this from its
+own try/except the moment an "sos" command is claimed, BEFORE
+``_validate_flight`` runs -- not alongside or after it -- so the alert's
+outcome can never depend on whether the flight validates, and neither call's
+outcome affects the other.
 
 Mirrors the pure/shell split used by weather.py and scheduler.py:
 
