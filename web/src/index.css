@@ -92,3 +92,14 @@
   text-shadow: 0 0 6px rgba(0, 229, 255, 0.6) !important;
   white-space: nowrap !important;
 }
+
+/* Ensure custom HTML div icons don't get white background box from default Leaflet CSS */
+.leaflet-div-icon {
+  background: transparent !important;
+  border: none !important;
+}
+
+.custom-drone-tactical-marker {
+  background: transparent !important;
+  border: none !important;
+}

@@ -163,6 +163,8 @@ export const App: React.FC = () => {
             dock={dock}
             activeMission={activeMission}
             isStale={isStale}
+            onIssueCommand={issueCommand}
+            isSending={isSending}
           />
         )}
 

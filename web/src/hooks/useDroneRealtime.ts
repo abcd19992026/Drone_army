@@ -121,20 +121,33 @@ export function useDroneRealtime() {
         }
       });
 
-    // 2. 1-second watchdog for timer tick
+    // 2. 1-second watchdog for staleness timer tick and dynamic high-frequency flight polling
+    let lastPollAt = 0;
     const watchdogInterval = setInterval(() => {
-      checkStaleness(droneRef.current);
-    }, 1000);
+      const current = droneRef.current;
+      checkStaleness(current);
 
-    // 3. 3-second backup polling interval to ensure no lost websocket frames
-    const pollInterval = setInterval(() => {
-      fetchDroneAndDock();
-    }, 3000);
+      // Adaptive polling cadence:
+      // When airborne/armed/returning: poll every 1000ms (1s) to ensure real-time map tracking
+      // When docked/stationary: poll every 3000ms (3s)
+      const isAirborne =
+        current?.armed === true ||
+        current?.status === 'flying' ||
+        current?.status === 'returning' ||
+        (current?.alt_m_relative != null && Number(current.alt_m_relative) > 1.5) ||
+        (current?.groundspeed_ms != null && Number(current.groundspeed_ms) > 0.5);
+
+      const requiredIntervalMs = isAirborne ? 1000 : 3000;
+      const now = Date.now();
+      if (now - lastPollAt >= requiredIntervalMs) {
+        lastPollAt = now;
+        fetchDroneAndDock();
+      }
+    }, 500);
 
     return () => {
       supabase.removeChannel(channel);
       clearInterval(watchdogInterval);
-      clearInterval(pollInterval);
     };
   }, [fetchDroneAndDock, checkStaleness, updateDroneState]);
 

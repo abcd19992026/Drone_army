@@ -129,6 +129,7 @@ export type CommandType =
   | 'weather_recall'
   | 'sos'
   | 'find_my_drone'
+  | 'goto'
   | string;
 
 export type CommandStatus =
